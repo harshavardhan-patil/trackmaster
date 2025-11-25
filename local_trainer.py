@@ -1,15 +1,3 @@
-"""
-Local Trainer for Distributed TrackMania PPO Training
-
-This script runs on your local machine and handles:
-1. TMRL environment interactions (env.reset(), env.step(), env.wait())
-2. Episode collection (observations, actions, rewards)
-3. Communication with remote Colab server via HTTP
-
-Usage:
-    python local_trainer.py --remote-url https://your-ngrok-url.ngrok.io --num-updates 10000
-"""
-
 import argparse
 import time
 import pickle
@@ -41,7 +29,9 @@ class LocalTrainer:
         remote_url: str,
         max_episode_steps: int = 2400,
         retry_attempts: int = 3,
-        timeout_seconds: int = 600
+        timeout_seconds: int = 600,
+        use_last_action_on_timeout: bool = True,
+        action_timeout_threshold: float = 0.15
     ):
         """
         Initialize local trainer
@@ -51,11 +41,15 @@ class LocalTrainer:
             max_episode_steps: Maximum steps per episode
             retry_attempts: Number of retry attempts for failed requests
             timeout_seconds: Maximum time to wait for training completion
+            use_last_action_on_timeout: If True, repeat last action when nearing timeout
+            action_timeout_threshold: Time threshold (seconds) to trigger last action repetition
         """
         self.remote_url = remote_url.rstrip('/')
         self.max_episode_steps = max_episode_steps
         self.retry_attempts = retry_attempts
         self.timeout_seconds = timeout_seconds
+        self.use_last_action_on_timeout = use_last_action_on_timeout
+        self.action_timeout_threshold = action_timeout_threshold
 
         self.session = requests.Session()
 
@@ -68,6 +62,15 @@ class LocalTrainer:
         # Statistics
         self.update_count = 0
         self.total_steps = 0
+
+        # Timeout tracking
+        self.last_action = None
+        self.last_logprob = 0.0
+        self.last_state_value = 0.0
+        self.actual_action_count = 0
+        self.timeout_action_count = 0
+        self.episode_actual_actions = 0
+        self.episode_timeout_actions = 0
 
     def check_server_health(self) -> bool:
         """Check if remote server is reachable"""
@@ -103,48 +106,92 @@ class LocalTrainer:
             logprob: log probability of the action
             state_value: critic's estimate of state value
         """
+        start_time = time.time()
+        used_last_action = False
+
         try:
             # Serialize observation
             data = pickle.dumps(observation)
 
-            # Request action from remote
-            # response = requests.post(
-            #     f"{self.remote_url}/action",
-            #     data=data,
-            #     headers={'Content-Type': 'application/octet-stream'},
-            #     timeout=5
-            # )
+            # Request action from remote with timeout threshold
             response = self.session.post(
                 f"{self.remote_url}/action",
                 data=data,
                 headers={'Content-Type': 'application/octet-stream'},
-                timeout=5
+                timeout=self.action_timeout_threshold
             )
+
+            elapsed = time.time() - start_time
 
             if response.status_code == 200:
                 result = pickle.loads(response.content)
-                return result['action'], result['logprob'], result['state_value']
+                action = result['action']
+                logprob = result['logprob']
+                state_value = result['state_value']
+
+                # Store as last action
+                self.last_action = action
+                self.last_logprob = logprob
+                self.last_state_value = state_value
+
+                # Track as actual action
+                self.actual_action_count += 1
+                self.episode_actual_actions += 1
+
+                return action, logprob, state_value
             else:
                 print(f"  Warning: Action request failed with status {response.status_code}")
+                used_last_action = True
+
+        except requests.exceptions.Timeout:
+            # Timeout occurred - use last action if enabled
+            elapsed = time.time() - start_time
+            if self.use_last_action_on_timeout and self.last_action is not None:
+                used_last_action = True
+            else:
+                print(f"  Warning: Action request timed out after {elapsed:.3f}s (no last action available)")
                 # Return random action as fallback
-                return np.random.uniform(-1, 1, 3), 0.0, 0.0
+                action = np.random.uniform(-1, 1, 3)
+                self.last_action = action
+                self.last_logprob = 0.0
+                self.last_state_value = 0.0
+                return action, 0.0, 0.0
 
         except Exception as e:
             print(f"  Warning: Action request error: {e}")
-            # Return random action as fallback
-            return np.random.uniform(-1, 1, 3), 0.0, 0.0
+            used_last_action = True
+
+        # If we need to use last action
+        if used_last_action:
+            if self.last_action is not None:
+                self.timeout_action_count += 1
+                self.episode_timeout_actions += 1
+                return self.last_action, self.last_logprob, self.last_state_value
+            else:
+                # No last action available, return random
+                action = np.random.uniform(-1, 1, 3)
+                self.last_action = action
+                self.last_logprob = 0.0
+                self.last_state_value = 0.0
+                self.actual_action_count += 1
+                self.episode_actual_actions += 1
+                return action, 0.0, 0.0
 
     def collect_episode(self) -> Dict[str, Any]:
         """
         Collect one complete episode using current policy
 
         Returns:
-            episode_data: Dictionary containing observations, actions, logprobs, rewards, state_values
+            episode_data: Dictionary containing observations, actions, logprobs, rewards, state_values, positions
         """
         print("\n  Collecting episode...")
 
         # Signal remote to prepare for new episode
         self.reset_remote_episode()
+
+        # Reset episode timeout counters
+        self.episode_actual_actions = 0
+        self.episode_timeout_actions = 0
 
         # Buffers for episode data
         observations = []
@@ -152,6 +199,7 @@ class LocalTrainer:
         logprobs = []
         rewards = []
         state_values = []
+        positions = []  # Store positions for trajectory-based rewards
 
         # Reset environment
         obs = self.env.reset()[0]
@@ -171,6 +219,18 @@ class LocalTrainer:
             actions.append(action)
             logprobs.append(logprob)
             state_values.append(state_value)
+
+            # Extract position from TMRL client (for trajectory-based rewards)
+            try:
+                data = self.env.unwrapped.interface.client.retrieve_data(sleep_if_empty=0.01, timeout=0.1)
+                position = np.array([data[2], data[3], data[4]], dtype=np.float32)  # x, y, z
+                positions.append(position)
+            except Exception as e:
+                # If position unavailable, append zeros (only warn on first occurrence)
+                if step_count == 0:
+                    print(f"    Warning: Could not retrieve position data: {e}")
+                    print(f"    Trajectory rewards will not be available for this episode")
+                positions.append(np.array([0.0, 0.0, 0.0], dtype=np.float32))
 
             # Clip action to valid range
             clamped_action = np.clip(action, -1, 1)
@@ -201,7 +261,16 @@ class LocalTrainer:
         elapsed = time.time() - start_time
         self.total_steps += step_count
 
+        # Calculate timeout percentage
+        total_episode_steps = self.episode_actual_actions + self.episode_timeout_actions
+        timeout_percent = (self.episode_timeout_actions / total_episode_steps * 100) if total_episode_steps > 0 else 0
+
         print(f"  ✓ Episode collected: {step_count} steps, reward: {episode_reward:.2f}, time: {elapsed:.1f}s")
+        print(f"    Action stats: {self.episode_actual_actions} actual, {self.episode_timeout_actions} repeated ({timeout_percent:.1f}% timeout)")
+        if self.use_last_action_on_timeout:
+            print(f"    Last-action repetition: ENABLED (threshold: {self.action_timeout_threshold}s)")
+        else:
+            print(f"    Last-action repetition: DISABLED")
 
         return {
             'observations': observations,
@@ -209,6 +278,7 @@ class LocalTrainer:
             'logprobs': logprobs,
             'rewards': rewards,
             'state_values': state_values,
+            'positions': positions,  # Include positions for trajectory rewards
             'episode_length': step_count,
             'episode_reward': episode_reward
         }
@@ -312,6 +382,9 @@ class LocalTrainer:
         print(f"Remote URL: {self.remote_url}")
         print(f"Number of updates: {num_updates}")
         print(f"Max episode steps: {self.max_episode_steps}")
+        print(f"Last-action repetition: {'ENABLED' if self.use_last_action_on_timeout else 'DISABLED'}")
+        if self.use_last_action_on_timeout:
+            print(f"Action timeout threshold: {self.action_timeout_threshold}s")
         print(f"{'='*60}\n")
 
         # Check server connectivity
@@ -343,18 +416,29 @@ class LocalTrainer:
             self.update_count += 1
             elapsed = time.time() - start_time
 
+            # Calculate cumulative timeout statistics
+            total_actions = self.actual_action_count + self.timeout_action_count
+            cumulative_timeout_percent = (self.timeout_action_count / total_actions * 100) if total_actions > 0 else 0
+
             print(f"\n{'='*60}")
             print(f"Update {self.update_count} complete")
             print(f"  Episode reward: {episode_data['episode_reward']:.2f}")
             print(f"  Episode length: {episode_data['episode_length']} steps")
             print(f"  Total steps: {self.total_steps}")
+            print(f"  Cumulative action stats: {self.actual_action_count} actual, {self.timeout_action_count} repeated ({cumulative_timeout_percent:.1f}%)")
             print(f"  Update time: {elapsed:.1f}s")
             print(f"{'='*60}")
+
+        # Calculate final timeout statistics
+        total_actions = self.actual_action_count + self.timeout_action_count
+        final_timeout_percent = (self.timeout_action_count / total_actions * 100) if total_actions > 0 else 0
 
         print(f"\n{'='*60}")
         print(f"Training Complete!")
         print(f"  Total updates: {self.update_count}")
         print(f"  Total steps: {self.total_steps}")
+        print(f"  Total actions: {self.actual_action_count} actual, {self.timeout_action_count} repeated")
+        print(f"  Overall timeout rate: {final_timeout_percent:.1f}%")
         print(f"{'='*60}\n")
 
 
@@ -379,13 +463,27 @@ def main():
         default=2400,
         help='Maximum steps per episode (default: 2400)'
     )
+    parser.add_argument(
+        '--use-last-action-on-timeout',
+        type=bool,
+        default=True,
+        help='If True, repeat last action when nearing timeout (default: True)'
+    )
+    parser.add_argument(
+        '--action-timeout-threshold',
+        type=float,
+        default=0.15,
+        help='Time threshold (seconds) to trigger last action repetition (default: 0.15)'
+    )
 
     args = parser.parse_args()
 
     # Create trainer
     trainer = LocalTrainer(
         remote_url=args.remote_url,
-        max_episode_steps=args.max_steps
+        max_episode_steps=args.max_steps,
+        use_last_action_on_timeout=args.use_last_action_on_timeout,
+        action_timeout_threshold=args.action_timeout_threshold
     )
 
     # Start training loop
