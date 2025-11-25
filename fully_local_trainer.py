@@ -5,96 +5,356 @@ import os
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import List, Tuple, Dict, Any
 import tmrl
 
 
-class Policy(nn.Module):
-    """Policy network for action selection"""
+# ============================================================
+# CNN Architecture Configuration
+# ============================================================
+# Default TMRL configuration: 4 grayscale images of 64 x 64 pixels
+imgs_buf_len = 4  # Number of stacked grayscale images
+img_height = 64   # Image height in pixels
+img_width = 64    # Image width in pixels
 
-    def __init__(self, observation_space: int, action_space: int, hidden_dim: int, avg_ray: float):
+
+# ============================================================
+# Helper Functions for CNN
+# ============================================================
+
+def conv2d_out_dims(conv_layer, h_in, w_in):
+    """
+    Calculate output dimensions of a Conv2d layer
+
+    Args:
+        conv_layer: nn.Conv2d layer
+        h_in: input height
+        w_in: input width
+
+    Returns:
+        (h_out, w_out): output dimensions
+    """
+    h_out = (h_in + 2 * conv_layer.padding[0] - conv_layer.dilation[0] * (conv_layer.kernel_size[0] - 1) - 1) // conv_layer.stride[0] + 1
+    w_out = (w_in + 2 * conv_layer.padding[1] - conv_layer.dilation[1] * (conv_layer.kernel_size[1] - 1) - 1) // conv_layer.stride[1] + 1
+    return h_out, w_out
+
+
+def num_flat_features(x):
+    """
+    Calculate number of features in a flattened tensor
+
+    Args:
+        x: input tensor
+
+    Returns:
+        number of features
+    """
+    size = x.size()[1:]  # all dimensions except the batch dimension
+    num_features = 1
+    for s in size:
+        num_features *= s
+    return num_features
+
+
+def mlp(sizes, activation, output_activation=nn.Identity):
+    """
+    Create a multi-layer perceptron
+
+    Args:
+        sizes: list of layer sizes
+        activation: activation function
+        output_activation: activation for output layer
+
+    Returns:
+        nn.Sequential MLP
+    """
+    layers = []
+    for j in range(len(sizes) - 1):
+        act = activation if j < len(sizes) - 2 else output_activation
+        layers += [nn.Linear(sizes[j], sizes[j + 1]), act()]
+    return nn.Sequential(*layers)
+
+
+class TrackMasterCNN(nn.Module):
+    """
+    CNN (Convolutional Neural Network) model for processing TMRL observations
+
+    Args:
+        q_net (bool): indicates whether this neural net is a critic network
+    """
+
+    def __init__(self, q_net):
+        super(TrackMasterCNN, self).__init__()
+
+        self.q_net = q_net
+
+        # Convolutional layers processing screenshots:
+        # The default config.json gives 4 grayscale images of 64 x 64 pixels
+        self.h_out, self.w_out = img_height, img_width
+        self.conv1 = nn.Conv2d(imgs_buf_len, 64, 8, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv1, self.h_out, self.w_out)
+        self.conv2 = nn.Conv2d(64, 64, 4, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv2, self.h_out, self.w_out)
+        self.conv3 = nn.Conv2d(64, 128, 4, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv3, self.h_out, self.w_out)
+        self.conv4 = nn.Conv2d(128, 128, 4, stride=2)
+        self.h_out, self.w_out = conv2d_out_dims(self.conv4, self.h_out, self.w_out)
+        self.out_channels = self.conv4.out_channels
+
+        # Dimensionality of the CNN output:
+        self.flat_features = self.out_channels * self.h_out * self.w_out
+
+        # Dimensionality of the MLP input:
+        # The MLP input will be formed of:
+        # - the flattened CNN output
+        # - the current speed, gear and RPM measurements (3 floats)
+        # - the 2 previous actions (2 x 3 floats), important because of the real-time nature of our controller
+        # - when the module is the critic, the selected action (3 floats)
+        float_features = 12 if self.q_net else 9
+        self.mlp_input_features = self.flat_features + float_features
+
+        # MLP layers:
+        # (when using the model as a policy, we will sample from a multivariate gaussian defined later;
+        # thus, the output dimensionality is 1 for the critic, and we will define the output layer of policies later)
+        self.mlp_layers = [256, 256, 1] if self.q_net else [256, 256]
+        self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
+
+    def forward(self, x):
+        """
+        Forward pass through the network
+
+        Args:
+            x: input tuple (speed, gear, rpm, images, act1, act2) or
+               (speed, gear, rpm, images, act1, act2, act) for critic
+
+        Returns:
+            output tensor
+        """
+        if self.q_net:
+            # The critic takes the next action (act) as additional input
+            # act1 and act2 are the actions in the action buffer (real-time RL):
+            speed, gear, rpm, images, act1, act2, act = x
+        else:
+            # For the policy, the next action (act) is what we are computing, so we don't have it:
+            speed, gear, rpm, images, act1, act2 = x
+
+        speed = speed / 1000.0  # Max speed approx 1000
+        rpm = rpm / 10000.0     # Max RPM approx 10000
+        gear = gear / 6.0       # Max gear 6
+        images = images / 255.0
+
+        # we will stack these greyscale images along the channel dimension of our input tensor)
+        x = F.relu(self.conv1(images))
+        x = F.relu(self.conv2(x))
+        x = F.relu(self.conv3(x))
+        x = F.relu(self.conv4(x))
+
+        # Now we will flatten our output feature map.
+        # Let us double-check that our dimensions are what we expect them to be:
+        flat_features = num_flat_features(x)
+        assert flat_features == self.flat_features, f"x.shape:{x.shape}, flat_features:{flat_features}, self.out_channels:{self.out_channels}, self.h_out:{self.h_out}, self.w_out:{self.w_out}"
+
+        # All good, let us flatten our output feature map:
+        x = x.view(-1, flat_features)
+
+        # Finally, we can feed the result along our float values to the MLP:
+        if self.q_net:
+            x = torch.cat((speed, gear, rpm, x, act1, act2, act), -1)
+        else:
+            # print(speed.size(), gear.size(), rpm.size(), x.size(), act1.size(), act2.size())
+            x = torch.cat((speed, gear, rpm, x, act1, act2), -1)
+        x = self.mlp(x)
+
+        # And this gives us the output of our deep neural network :)
+        return x
+
+
+class Policy(nn.Module):
+    """Policy network for action selection using CNN"""
+
+    def __init__(self, action_space: int = 3):
         super().__init__()
-        self.avg_ray = avg_ray
         self.action_space = action_space
 
+        # CNN backbone (q_net=False for policy)
+        self.backbone = TrackMasterCNN(q_net=False)
+
+        # Output layers for action distribution
+        # The backbone outputs 256 features
+        mlp_output_size = self.backbone.mlp_layers[-1]
+
+        # Action mean layer (outputs 3 actions: steering, throttle, brake)
         self.action_mean = nn.Sequential(
-            nn.Linear(observation_space, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, action_space),
-            nn.Tanh()
+            nn.Linear(mlp_output_size, action_space),
+            nn.Tanh()  # Bound actions to [-1, 1]
         )
 
-        self.actor_logvar = nn.Sequential(
-            nn.Linear(observation_space, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
+        # Action log variance layer (single shared variance for all action dimensions)
+        self.actor_logvar = nn.Linear(mlp_output_size, 1)
 
     def sample_action_with_logprobs(self, observation):
+        """Sample action and compute log probability"""
         dist = self(observation)
         sample_action = dist.sample()
         return sample_action, dist.log_prob(sample_action)
 
     def mean_only(self, observation):
+        """Get mean action without sampling (for evaluation)"""
         with torch.no_grad():
-            return self.action_mean(observation)
+            # Forward through backbone
+            features = self.backbone(observation)
+            return self.action_mean(features)
 
     def get_action_log_prob(self, observation, action):
+        """Get log probability of given action"""
         dist = self(observation)
         return dist.log_prob(action)
 
     def forward(self, observation):
-        observation = observation / self.avg_ray
-        means = self.action_mean(observation)
-        vars = torch.zeros(observation.shape[0], self.action_space).to(observation.device)
-        vars[:, :] = self.actor_logvar(observation).exp().view(-1, 1)
-        covar_mat = torch.zeros(observation.shape[0], self.action_space, self.action_space).to(observation.device)
+        """
+        Forward pass to create action distribution
+
+        Args:
+            observation: tuple of (speed, gear, rpm, images, act1, act2)
+
+        Returns:
+            MultivariateNormal distribution over actions
+        """
+        # Forward through CNN backbone
+        features = self.backbone(observation)
+
+        # Get action means
+        means = self.action_mean(features)
+
+        # Get log variance
+        log_vars = self.actor_logvar(features)
+        # Clamp log_variance to a safe range
+        # min -20 (std ~0.00004), max 2 (std ~2.7)
+        log_vars = torch.clamp(log_vars, min=-20, max=2)
+        
+        # Calculate variance (shared across action dimensions)
+        vars = torch.zeros(features.shape[0], self.action_space).to(features.device)
+        vars[:, :] = log_vars.exp().view(-1, 1)
+
+        # Create covariance matrix (diagonal)
+        covar_mat = torch.zeros(features.shape[0], self.action_space, self.action_space).to(features.device)
         covar_mat[:, np.arange(self.action_space), np.arange(self.action_space)] = vars
 
+        # Create and return distribution
         dist = torch.distributions.MultivariateNormal(means, covar_mat)
         return dist
 
 
 class Critic(nn.Module):
-    """Critic network for state value estimation"""
+    """Critic network for state value estimation using CNN"""
 
-    def __init__(self, observation_space: int, hidden_dim: int, avg_ray: float):
+    def __init__(self):
         super().__init__()
-        self.avg_ray = avg_ray
 
-        self.network = nn.Sequential(
-            nn.Linear(observation_space, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Linear(hidden_dim, 1)
-        )
+        # CNN backbone (q_net=False since we estimate V(s) not Q(s,a) for PPO)
+        self.backbone = TrackMasterCNN(q_net=False)
+
+        # Output layer to produce single value
+        # The backbone outputs 256 features
+        mlp_output_size = 256  # Last layer of backbone MLP
+        self.value_head = nn.Linear(mlp_output_size, 1)
 
     def forward(self, observation):
-        observation = observation / self.avg_ray
-        return self.network(observation)
+        """
+        Forward pass to estimate state value
+
+        Args:
+            observation: tuple of (speed, gear, rpm, images, act1, act2)
+
+        Returns:
+            State value V(s) as a tensor
+        """
+        # The backbone expects (speed, gear, rpm, images, act1, act2)
+        features = self.backbone(observation)
+        value = self.value_head(features)
+        return value
 
 
 class Agent(nn.Module):
     """Agent combining Policy and Critic"""
 
-    def __init__(self, observation_space: int, action_space: int, hidden_dim: int, avg_ray: float):
+    def __init__(self, action_space: int = 3):
         super().__init__()
-        self.policy = Policy(observation_space, action_space, hidden_dim, avg_ray)
-        self.critic = Critic(observation_space, hidden_dim, avg_ray)
+        self.policy = Policy(action_space=action_space)
+        self.critic = Critic()
 
     def forward(self, x):
         raise SyntaxError('Propagate through Agent.policy and Agent.critic individually')
 
 
-def env_obs_to_tensor(observations):
-    """Convert TMRL observation tuple to flattened tensor"""
-    tensors = [torch.tensor(observation, dtype=torch.float32).view(-1) for observation in observations]
-    return torch.cat(tuple(tensors), dim=-1)
+def env_obs_to_tensor(observation, device='cpu'):
+    """
+    Convert TMRL observation tuple to tensor tuple for CNN
+
+    Args:
+        observation: TMRL observation tuple (speed, gear, rpm, images, act1, act2)
+        device: torch device to place tensors on
+
+    Returns:
+        tuple of tensors: (speed, gear, rpm, images, act1, act2)
+    """
+    speed, gear, rpm, images, act1, act2 = observation
+
+    # Convert each component to tensor with appropriate shape
+    speed_t = torch.tensor(speed, dtype=torch.float32, device=device).unsqueeze(1)
+    gear_t = torch.tensor(gear, dtype=torch.float32, device=device).unsqueeze(1)
+    rpm_t = torch.tensor(rpm, dtype=torch.float32, device=device).unsqueeze(1)
+
+    # Images: should be [batch, channels, height, width]
+    # TMRL gives [4, 64, 64] (4 grayscale images)
+    images_t = torch.tensor(images, dtype=torch.float32, device=device).unsqueeze(0)  # [1, 4, 64, 64]
+
+    # Actions: flatten to [batch, 3]
+    act1_t = torch.tensor(act1, dtype=torch.float32, device=device).unsqueeze(0)      # [batch, 3]
+    act2_t = torch.tensor(act2, dtype=torch.float32, device=device).unsqueeze(0)      # [batch, 3]
+
+    return (speed_t, gear_t, rpm_t, images_t, act1_t, act2_t)
+
+
+def batch_obs_to_tensor(observations, device='cpu'):
+    """
+    Convert batch of TMRL observations to tensor tuple for CNN
+
+    Args:
+        observations: list of TMRL observation tuples
+        device: torch device to place tensors on
+
+    Returns:
+        tuple of batched tensors: (speed, gear, rpm, images, act1, act2)
+    """
+    batch_size = len(observations)
+
+    # Separate components
+    speeds, gears, rpms, images_list, act1s, act2s = [], [], [], [], [], []
+
+    for obs in observations:
+        speed, gear, rpm, images, act1, act2 = obs
+        speeds.append(speed)
+        gears.append(gear)
+        rpms.append(rpm)
+        images_list.append(images)
+        act1s.append(act1)
+        act2s.append(act2)
+
+    # Convert to batched tensors
+    speed_t = torch.tensor(speeds, dtype=torch.float32, device=device)
+    gear_t = torch.tensor(gears, dtype=torch.float32, device=device)
+    rpm_t = torch.tensor(rpms, dtype=torch.float32, device=device)
+
+    # Images: stack to [batch, channels, height, width]
+    images_t = torch.tensor(images_list, dtype=torch.float32, device=device)  # [batch, 4, 64, 64]
+
+    # Actions
+    act1_t = torch.tensor(act1s, dtype=torch.float32, device=device)     # [batch, 3]
+    act2_t = torch.tensor(act2s, dtype=torch.float32, device=device)  # [batch, 3]
+
+    return (speed_t, gear_t, rpm_t, images_t, act1_t, act2_t)
 
 
 class RewardFunction:
@@ -262,12 +522,7 @@ class FullyLocalTrainer:
 
         # Initialize agent
         print("Initializing agent...")
-        self.agent = Agent(
-            self.observation_space,
-            self.action_space,
-            self.hyper_params['hidden_dim'],
-            self.hyper_params['avg_ray']
-        ).to(self.device)
+        self.agent = Agent(action_space=self.action_space).to(self.device)
 
         # Optimizers
         self.policy_optim = torch.optim.Adam(
@@ -279,8 +534,8 @@ class FullyLocalTrainer:
             lr=self.hyper_params['critic_lr']
         )
 
-        print(f"  Policy parameters: {sum(p.numel() for p in self.agent.policy.parameters()):,}")
-        print(f"  Critic parameters: {sum(p.numel() for p in self.agent.critic.parameters()):,}")
+        print(f"Policy parameters: {sum(p.numel() for p in self.agent.policy.parameters()):,}")
+        print(f"Critic parameters: {sum(p.numel() for p in self.agent.critic.parameters()):,}")
 
         # Load trajectory if provided
         self.trajectory_reward_fn = None
@@ -331,8 +586,8 @@ class FullyLocalTrainer:
             logprob: log probability of the action
             state_value: critic's estimate of state value
         """
-        # Convert observation to tensor
-        obs_tensor = env_obs_to_tensor(observation).unsqueeze(0).to(self.device)
+        # Convert observation to tensor tuple
+        obs_tensor = env_obs_to_tensor(observation, device=self.device)
 
         # Get action from policy
         self.agent.eval()
@@ -340,7 +595,7 @@ class FullyLocalTrainer:
             action, logprob = self.agent.policy.sample_action_with_logprobs(obs_tensor)
             state_value = self.agent.critic(obs_tensor)
 
-        return action[0].cpu().numpy(), logprob[0].cpu().item(), state_value[0].cpu().item()
+        return action[0].cpu().numpy(), logprob[0].cpu().item(), state_value[0, 0].cpu().item()
 
     def collect_episode(self) -> Dict[str, Any]:
         """
@@ -458,7 +713,7 @@ class FullyLocalTrainer:
 
         # Add trajectory-based rewards if available
         if self.trajectory_reward_fn is not None and 'positions' in episode_data:
-            print(f"  Computing trajectory-based rewards...")
+            print(f"Computing trajectory-based rewards...")
             self.trajectory_reward_fn.reset()
             trajectory_rewards = []
 
@@ -472,8 +727,8 @@ class FullyLocalTrainer:
             # Combine original rewards with trajectory rewards
             rewards = rewards + trajectory_rewards
 
-            print(f"  Trajectory reward contribution: {total_traj_reward:.4f}")
-            print(f"  Combined episode reward: {rewards.sum().item():.2f}")
+            print(f"Trajectory reward contribution: {total_traj_reward:.4f}")
+            print(f"Combined episode reward: {rewards.sum().item():.2f}")
             episode_data['rewards'] = rewards.sum().item()
 
         # Compute returns (discounted cumulative rewards)
@@ -511,7 +766,7 @@ class FullyLocalTrainer:
 
                 # Extract batch
                 batch_obs = [observations[i] for i in batch_idxs]
-                batch_obs_tensor = torch.stack([env_obs_to_tensor(obs) for obs in batch_obs]).to(self.device)
+                batch_obs_tensor = batch_obs_to_tensor(batch_obs, device=self.device)
                 batch_actions = actions[batch_idxs].to(self.device)
                 batch_old_logprobs = old_logprobs[batch_idxs].to(self.device)
                 batch_returns = returns[batch_idxs].to(self.device)
@@ -536,7 +791,7 @@ class FullyLocalTrainer:
                     1 - self.hyper_params['clip_coef'],
                     1 + self.hyper_params['clip_coef']
                 ) * batch_advantages
-                ppo_loss = torch.max(unclipped_obj, clipped_obj).sum() / len(batch_idxs)
+                ppo_loss = torch.max(unclipped_obj, clipped_obj).sum() / len(batch_idxs) # max because we are calculating as loss so sign flips
 
                 # ========== Critic Loss ==========
                 new_values = self.agent.critic(batch_obs_tensor).squeeze()
