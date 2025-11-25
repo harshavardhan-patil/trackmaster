@@ -19,6 +19,19 @@ import requests
 from typing import List, Tuple, Dict, Any
 import tmrl
 
+# _original_save_ghost = tmrl.custom.tm.utils.tools.save_ghost
+
+# def _safe_save_ghost(*args, **kwargs):
+#     try:
+#         return _original_save_ghost(*args, **kwargs)
+#     except ConnectionRefusedError:
+#         # WinError 10061: Game refused connection. Not critical, just skip saving.
+#         print("  ⚠ Warning: Could not save ghost (Game refused connection). Continuing...")
+#     except Exception as e:
+#         print(f"  ⚠ Warning: Ghost save failed: {e}")
+
+# # Apply the patch
+# tmrl.custom.tm.utils.tools.save_ghost = _safe_save_ghost
 
 class LocalTrainer:
     """Collects episodes locally and syncs with remote trainer"""
@@ -43,6 +56,8 @@ class LocalTrainer:
         self.max_episode_steps = max_episode_steps
         self.retry_attempts = retry_attempts
         self.timeout_seconds = timeout_seconds
+
+        self.session = requests.Session()
 
         # Initialize TMRL environment
         print("Initializing TMRL environment...")
@@ -93,7 +108,13 @@ class LocalTrainer:
             data = pickle.dumps(observation)
 
             # Request action from remote
-            response = requests.post(
+            # response = requests.post(
+            #     f"{self.remote_url}/action",
+            #     data=data,
+            #     headers={'Content-Type': 'application/octet-stream'},
+            #     timeout=5
+            # )
+            response = self.session.post(
                 f"{self.remote_url}/action",
                 data=data,
                 headers={'Content-Type': 'application/octet-stream'},
