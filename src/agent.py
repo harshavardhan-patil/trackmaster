@@ -61,6 +61,11 @@ class Actor(nn.Module):
 
         # Get action means
         means = self.action_mean(features)
+        means = torch.stack([
+          torch.sigmoid(means[:, 0]),  # Gas: 0 to 1
+          torch.sigmoid(means[:, 1]),  # Brake: 0 to 1
+          torch.tanh(means[:, 2])      # Steering: -1 to 1
+      ], dim=1)
 
         # Get log variance
         log_vars = self.actor_logvar(features)

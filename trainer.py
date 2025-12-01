@@ -2,6 +2,7 @@ import argparse
 import time
 import pickle
 import os
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -78,66 +79,223 @@ def batch_obs_to_tensor(observations, device='cpu'):
 
     return (speed_t, gear_t, rpm_t, images_t, act1_t, act2_t)
 
-# todo: Reward for moving forward
 class RewardFunction:
-    """Trajectory-based rewards for guided learning"""
-
-    def __init__(self, trajectory, scale=0.01, max_dist=60.0,
-                 check_forward=10, check_backward=10,
-                 failure_countdown=10, min_steps=70):
+    def __init__(self, trajectory, scale, max_dist,
+                 check_forward, check_backward,
+                 failure_countdown, min_steps, debug=False):
         self.trajectory = trajectory
         self.scale = scale
         self.max_dist = max_dist
-        self.check_forward = check_forward
+        self.check_forward = check_forward  
         self.check_backward = check_backward
         self.failure_countdown = failure_countdown
         self.min_steps = min_steps
+        self.debug = debug
+
+        # State tracking
         self.cur_idx = 0
+        self.last_checkpoint = 0  # Track last valid checkpoint reached
         self.step_counter = 0
         self.failure_counter = 0
+        self.prev_position = None
+        self.last_progress_position = None  # Track position for distance-based failure detection
+        self.distance_since_last_progress = 0.0 
 
-    def compute_reward(self, position):
-        """Compute reward based on progress along trajectory"""
+    def compute_reward(self, position, speed, action, gear=1):
+        """
+        Args:
+            position: [x, y, z] numpy array
+            speed: current speed (float, approx km/h)
+            action: [steering, throttle, brake] numpy array
+            gear: current gear (0 = reverse, 1+ = forward gears)
+        """
         self.step_counter += 1
-        min_dist = float('inf')
-        best_idx = self.cur_idx
 
-        # Search forward for best matching position
-        for i in range(self.cur_idx, min(len(self.trajectory), self.cur_idx + self.check_forward)):
+        # 1. FIND TRAJECTORY INDEX (CHECKPOINT-BASED)
+        # ------------------------------------------------
+        # Only search from last_checkpoint to last_checkpoint + check_forward
+        # This prevents reward hacking by cutting the track or reversing to nearby checkpoints
+        min_dist = float('inf')
+        best_idx = self.last_checkpoint
+
+        # Search only in the next few checkpoints from last valid checkpoint
+        search_start = self.last_checkpoint
+        search_end = min(len(self.trajectory), self.last_checkpoint + self.check_forward)
+
+        if self.debug and self.step_counter % 100 == 0:
+            print(f"\n[DEBUG Step {self.step_counter}] Checkpoint Search:")
+            print(f"  Searching checkpoints {search_start} to {search_end} (range: {search_end - search_start})")
+            print(f"  Car position: {position}")
+            print(f"  Current checkpoint idx: {self.cur_idx}, Last valid: {self.last_checkpoint}")
+
+        for i in range(search_start, search_end):
             dist = np.linalg.norm(position - self.trajectory[i])
+            if self.debug and self.step_counter % 100 == 0:
+                print(f"  Checkpoint {i}: dist={dist:.2f}m")
             if dist < min_dist:
                 min_dist = dist
                 best_idx = i
 
-        # If too far from trajectory, no reward
-        if min_dist > self.max_dist:
-            best_idx = self.cur_idx
+        if self.debug and self.step_counter % 100 == 0:
+            print(f"  Best checkpoint: {best_idx}, distance: {min_dist:.2f}m (max allowed: {self.max_dist}m)")
 
-        # Reward proportional to progress
-        reward = (best_idx - self.cur_idx) * self.scale
+        # If we found a valid checkpoint ahead, update last_checkpoint
+        old_last_checkpoint = self.last_checkpoint
+        if best_idx > self.last_checkpoint and min_dist < self.max_dist:
+            self.last_checkpoint = best_idx
 
-        # If no progress, check backward and count failures
-        if best_idx == self.cur_idx:
-            for i in range(max(0, self.cur_idx - self.check_backward), self.cur_idx):
-                dist = np.linalg.norm(position - self.trajectory[i])
-                if dist < min_dist:
-                    min_dist = dist
-                    best_idx = i
+        # Use last_checkpoint as current index (prevents backwards movement)
+        best_idx = self.last_checkpoint
 
-            if self.step_counter > self.min_steps:
-                self.failure_counter += 1
+        if self.debug and self.step_counter % 100 == 0 and self.last_checkpoint != old_last_checkpoint:
+            print(f"  ✓ Progress! Checkpoint {old_last_checkpoint} -> {self.last_checkpoint}") 
+
+        # 2. CALCULATE VECTORS
+        # ------------------------------------------------
+        # Track Vector (Where we SHOULD be going)
+        # Look ahead 10 checkpoints to get meaningful direction (handles high-res trajectories)
+        lookahead = min(10, len(self.trajectory) - best_idx - 1)
+        if lookahead > 0:
+            track_vec = self.trajectory[best_idx + lookahead] - self.trajectory[best_idx]
         else:
-            self.failure_counter = 0
+            track_vec = np.array([0, 0, 0])
 
+        # Car Vector (Where we ARE going)
+        if self.prev_position is not None:
+            car_vec = position - self.prev_position
+        else:
+            car_vec = np.array([0, 0, 0])
+
+        # 3. CALCULATE REWARDS
+        # ------------------------------------------------
+
+        # A. Progress Reward (Base)
+        progress_reward = (best_idx - self.cur_idx) * self.scale
+
+        if self.debug and self.step_counter % 100 == 0:
+            print(f"\n[DEBUG Step {self.step_counter}] Reward Calculation:")
+            print(f"  Progress: (best_idx={best_idx} - cur_idx={self.cur_idx}) * scale={self.scale}")
+            print(f"  Progress reward (raw): {progress_reward:.4f}")
+
+        # B. Effective Speed Reward (Velocity along the line)
+        alignment = 0.0
+        norm_track = np.linalg.norm(track_vec)
+        norm_car = np.linalg.norm(car_vec)
+
+        if norm_track > 0 and norm_car > 0:
+            # Cosine similarity
+            alignment = np.dot(track_vec, car_vec) / (norm_track * norm_car)
+
+        # Scale down speed (0-1000) to reasonable reward size (e.g. 0-2.0)
+        # Only reward speed if alignment is positive
+        if alignment > 0:
+            effective_speed_reward = (speed * alignment) * 0.001
+        else:
+            effective_speed_reward = 0.0
+
+        if self.debug and self.step_counter % 100 == 0:
+            print(f"  Track vector: {track_vec} (norm: {norm_track:.2f})")
+            print(f"  Car vector: {car_vec} (norm: {norm_car:.2f})")
+            print(f"  Alignment (cosine): {alignment:.4f}")
+            print(f"  Speed: {speed:.2f} km/h")
+            print(f"  Speed reward (raw): {effective_speed_reward:.4f}")
+
+        # C. Gas Bias
+        # If throttle (action[1]) > 0.8
+        gas_bonus = 0.0
+        if action[1] > 0.8:
+            gas_bonus = 0.5 * self.scale
+
+        # D. Reverse Tax
+        # Penalty for reversing to avoid reward hacking
+        # gear == 0 means reverse gear
+        reverse_tax = 0.0
+        if gear == 0:
+            reverse_tax = speed * self.scale
+
+        # E. Parking Fine
+        # If we are 2 seconds into the race and stopped, punish idleness.
+        parking_fine = 0.0
+        if self.step_counter > 40 and abs(speed) < 1.0:
+            parking_fine = 0.05
+
+        if self.debug and self.step_counter % 100 == 0:
+            print(f"  Gas bonus: {gas_bonus:.4f} (throttle={action[1]:.2f})")
+            print(f"  Reverse tax: {reverse_tax:.4f} (gear={gear})")
+            print(f"  Parking fine: {parking_fine:.4f}")
+            total_raw = progress_reward + effective_speed_reward + gas_bonus - reverse_tax - parking_fine
+            print(f"  Total (alpha): {total_raw:.4f}")
+
+        # 4. TOTAL & UPDATES
+        # ------------------------------------------------
+        total_reward = (progress_reward
+                        + effective_speed_reward
+                        + gas_bonus
+                        - reverse_tax
+                        - parking_fine)
+
+        # Package individual components for logging
+        reward_components = {
+            'progress_reward': progress_reward,
+            'effective_speed_reward': effective_speed_reward,
+            'gas_bonus': gas_bonus,
+            'reverse_tax': reverse_tax,
+            'parking_fine': parking_fine
+        }
+
+        # Update state
         self.cur_idx = best_idx
+        self.prev_position = position.copy()
+
+        # Continue is step count less than exploratory min steps
+        if self.step_counter < self.min_steps:
+            return total_reward, False, reward_components
+
+        # Failure check (Stuck logic)
+        # Track if car is making progress via checkpoint advancement OR distance traveled
+        made_progress = False
+
+        # Check 1: Advanced to a new checkpoint?
+        if best_idx > self.cur_idx:
+            made_progress = True
+            self.last_progress_position = position.copy()
+            self.distance_since_last_progress = 0.0
+        else:
+            # Check 2: Traveled significant distance (>1m) without checkpoint advancement?
+            # This handles slow movement through high-res trajectories
+            if self.last_progress_position is not None:
+                distance_traveled = np.linalg.norm(position - self.last_progress_position)
+                if distance_traveled > 1.0:  # Reset if moved >1m
+                    made_progress = True
+                    self.last_progress_position = position.copy()
+                    self.distance_since_last_progress = 0.0
+
+        if made_progress:
+            self.failure_counter = 0
+        else:
+            self.failure_counter += 1
+
         terminated = self.failure_counter > self.failure_countdown
-        return reward, terminated
+
+        # Hard terminate if hopelessly lost
+        if min_dist > (self.max_dist * 2.0):
+            terminated = True
+
+        return total_reward, terminated, reward_components
+
+    def update_curriculum_params(self, failure_countdown: int, min_steps: int):
+        """Update curriculum learning parameters"""
+        self.failure_countdown = failure_countdown
+        self.min_steps = min_steps
 
     def reset(self):
-        """Reset for new episode"""
         self.cur_idx = 0
+        self.last_checkpoint = 0
         self.step_counter = 0
         self.failure_counter = 0
+        self.prev_position = None
+        self.last_progress_position = None
+        self.distance_since_last_progress = 0.0
 
 
 class FullyLocalTrainer:
@@ -150,26 +308,32 @@ class FullyLocalTrainer:
         trajectory_path: Optional[str] = None,
         device: Optional[str] = None,
         # Hyperparameters
-        policy_lr: float = 3e-4,
-        critic_lr: float = 3e-4,
+        policy_lr: float = 1e-5,
+        critic_lr: float = 1e-5,
         gamma: float = 0.996,
         clip_coef: float = 0.2,
         critic_coef: float = 0.1,
         entropy_coef: float = 0.1,
         batch_size: int = 128,
         epochs_per_update: int = 50,
+        episodes_per_update: int = 4,
         hidden_dim: int = 32,
         norm_advantages: bool = True,
         grad_clip_val: float = 0.5,
+        gae_lambda: float = 0.95,
         initial_std: float = 1.0,
         avg_ray: float = 400.0,
         # Trajectory reward parameters
-        reward_scale: float = 0.01,
+        reward_scale: float = 0.1,
         max_dist_from_traj: float = 60.0,
-        check_forward: int = 10,
+        check_forward: int = 1000,
         check_backward: int = 10,
-        failure_countdown: int = 10,
-        min_steps_before_failure: int = 70
+        # Curriculum learning parameters
+        initial_failure_countdown: int = 1000,
+        final_failure_countdown: int = 1500,
+        initial_min_steps: int = 500,
+        final_min_steps: int = 1500,
+        curriculum_updates: int = 1000
     ):
         """
         Initialize fully local trainer
@@ -186,18 +350,25 @@ class FullyLocalTrainer:
             critic_coef: Critic loss coefficient
             entropy_coef: Entropy bonus coefficient
             batch_size: Mini-batch size for training
-            epochs_per_update: Number of epochs per episode
+            epochs_per_update: Number of epochs per training update
+            episodes_per_update: Number of episodes to collect before each training update
             hidden_dim: Hidden layer dimension
             norm_advantages: Whether to normalize advantages
             grad_clip_val: Gradient clipping value
+            gae_lambda: GAE lambda parameter for advantage estimation (0.0 = no GAE, 1.0 = Monte Carlo)
             initial_std: Initial standard deviation for policy
             avg_ray: Average ray value for normalization
             reward_scale: Scale factor for trajectory progress rewards
             max_dist_from_traj: Max distance from trajectory before reward = 0
             check_forward: Allow cuts up to N positions ahead
             check_backward: Allow rewinding up to N positions back
-            failure_countdown: Terminate after N steps with no progress
-            min_steps_before_failure: Minimum steps before termination
+            failure_countdown: Terminate after N steps with no progress (used if no curriculum)
+            min_steps_before_failure: Minimum steps before termination (used if no curriculum)
+            initial_failure_countdown: Starting value for curriculum learning
+            final_failure_countdown: Final value for curriculum learning
+            initial_min_steps: Starting min steps for curriculum learning
+            final_min_steps: Final min steps for curriculum learning
+            curriculum_updates: Number of updates to linearly schedule curriculum over
         """
         self.max_episode_steps = max_episode_steps
         self.checkpoint_dir = checkpoint_dir
@@ -225,9 +396,11 @@ class FullyLocalTrainer:
             'entropy_coef': entropy_coef,
             'batch_size': batch_size,
             'epochs_per_update': epochs_per_update,
+            'episodes_per_update': episodes_per_update,
             'hidden_dim': hidden_dim,
             'norm_advantages': norm_advantages,
             'grad_clip_val': grad_clip_val,
+            'gae_lambda': gae_lambda,
             'initial_std': initial_std,
             'avg_ray': avg_ray
         }
@@ -263,7 +436,7 @@ class FullyLocalTrainer:
         self.trajectory_reward_fn = None
         if trajectory_path is not None and os.path.exists(trajectory_path):
             print(f"\n{'='*60}")
-            print("Loading Trajectory for Guided Learning")
+            print("Loading Custom Reward Function")
             print(f"{'='*60}")
             try:
                 with open(trajectory_path, 'rb') as f:
@@ -276,20 +449,32 @@ class FullyLocalTrainer:
                     max_dist=max_dist_from_traj,
                     check_forward=check_forward,
                     check_backward=check_backward,
-                    failure_countdown=failure_countdown,
-                    min_steps=min_steps_before_failure
+                    failure_countdown=initial_failure_countdown,
+                    min_steps=initial_min_steps,
+                    debug=False  # Disable debug logging
                 )
 
-                print(f"✓ Trajectory reward function initialized")
+                print(f"✓ Custom reward function initialized")
+                print(f"  ⚠ TMRL rewards will be COMPLETELY IGNORED")
+                print(f"  ⚠ Using ONLY custom trajectory-based rewards")
                 print(f"  Reward scale: {reward_scale}")
                 print(f"  Max distance from trajectory: {max_dist_from_traj}m")
                 print(f"{'='*60}\n")
             except Exception as e:
                 print(f"✗ Failed to load trajectory: {e}")
-                print("  Continuing without trajectory-based rewards")
+                print("  Continuing with TMRL rewards")
                 self.trajectory_reward_fn = None
         else:
-            print(f"\n⚠ No trajectory provided - using standard rewards only\n")
+            print(f"\n⚠ No trajectory provided - using TMRL rewards only\n")
+
+        # Curriculum learning parameters
+        self.curriculum_config = {
+            'initial_failure_countdown': initial_failure_countdown,
+            'final_failure_countdown': final_failure_countdown,
+            'initial_min_steps': initial_min_steps,
+            'final_min_steps': final_min_steps,
+            'curriculum_updates': curriculum_updates
+        }
 
         # Statistics
         self.update_count = 0
@@ -319,6 +504,40 @@ class FullyLocalTrainer:
 
         return action[0].cpu().numpy(), logprob[0].cpu().item(), state_value[0, 0].cpu().item()
 
+    def update_curriculum(self):
+        """
+        Update curriculum learning parameters based on training progress.
+        Linearly interpolates between initial and final values over curriculum_updates.
+        """
+        if self.trajectory_reward_fn is None:
+            return  # No reward function to update
+
+        # Calculate progress (clamped between 0 and 1)
+        progress = min(1.0, self.update_count / self.curriculum_config['curriculum_updates'])
+
+        # Linear interpolation
+        current_failure_countdown = int(
+            self.curriculum_config['initial_failure_countdown'] +
+            progress * (self.curriculum_config['final_failure_countdown'] -
+                       self.curriculum_config['initial_failure_countdown'])
+        )
+
+        current_min_steps = int(
+            self.curriculum_config['initial_min_steps'] +
+            progress * (self.curriculum_config['final_min_steps'] -
+                       self.curriculum_config['initial_min_steps'])
+        )
+
+        # Update reward function
+        self.trajectory_reward_fn.update_curriculum_params(
+            failure_countdown=current_failure_countdown,
+            min_steps=current_min_steps
+        )
+
+        # Log every 10 updates
+        if self.update_count % 10 == 0:
+            print(f"  Curriculum update: failure_countdown={current_failure_countdown}, min_steps={current_min_steps}")
+
     def collect_episode(self) -> Dict[str, Any]:
         """
         Collect one complete episode using current policy
@@ -335,9 +554,21 @@ class FullyLocalTrainer:
         rewards = []
         state_values = []
         positions = []  # Store positions for trajectory-based rewards
+        speeds = []
 
-        # Reset environment
+        # Track individual reward components
+        reward_component_totals = {
+            'progress_reward': 0.0,
+            'effective_speed_reward': 0.0,
+            'gas_bonus': 0.0,
+            'reverse_tax': 0.0,
+            'parking_fine': 0.0
+        }
+
+        # Reset environment and custom reward function
         obs = self.env.reset()[0]
+        if self.trajectory_reward_fn is not None:
+            self.trajectory_reward_fn.reset()
 
         step_count = 0
         done = False
@@ -355,31 +586,48 @@ class FullyLocalTrainer:
             logprobs.append(logprob)
             state_values.append(state_value)
 
-            # Extract position from TMRL client (for trajectory-based rewards)
-            try:
-                data = self.env.unwrapped.interface.client.retrieve_data(sleep_if_empty=0.01, timeout=0.1)
-                position = np.array([data[2], data[3], data[4]], dtype=np.float32)  # x, y, z
-                positions.append(position)
-            except Exception as e:
-                # If position unavailable, append zeros (only warn on first occurrence)
-                if step_count == 0:
-                    print(f"    Warning: Could not retrieve position data: {e}")
-                    print(f"    Trajectory rewards will not be available for this episode")
-                positions.append(np.array([0.0, 0.0, 0.0], dtype=np.float32))
+            # Extract position, speed, and gear for custom reward function
+            # Observation format: (speed, gear, rpm, images, act1, act2)
+            speed = float(obs[0]) if hasattr(obs[0], '__iter__') else obs[0]
+            gear = float(obs[1]) if hasattr(obs[1], '__iter__') else obs[1]
+            position = None
+
+            if self.trajectory_reward_fn is not None:
+                try:
+                    data = self.env.unwrapped.interface.client.retrieve_data(sleep_if_empty=0.01, timeout=0.1)
+                    position = np.array([data[2], data[3], data[4]], dtype=np.float32)  # x, y, z
+                    positions.append(position)
+                except Exception as e:
+                    # If position unavailable, append zeros (only warn on first occurrence)
+                    if step_count == 0:
+                        print(f"    Warning: Could not retrieve position data: {e}")
+                        print(f"    Custom reward function will not be available for this episode")
+                    position = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+                    positions.append(position)
 
             # Clip action to valid range
             clamped_action = np.clip(action, -1, 1)
 
-            # Step environment
-            next_obs, reward, terminated, truncated, info = self.env.step(clamped_action)
+            # Step environment (we ignore TMRL reward when using custom reward function)
+            next_obs, tmrl_reward, terminated, truncated, info = self.env.step(clamped_action)
 
-            # Custom termination: stuck on rail (low LIDAR readings)
-            # next_obs[2] is RPM/LIDAR data
-            if next_obs[2][next_obs[2] <= 40].sum() > 0:
-                terminated = True
+            # Compute reward using custom reward function if available
+            if self.trajectory_reward_fn is not None and position is not None:
+                custom_reward, custom_terminated, reward_components = self.trajectory_reward_fn.compute_reward(
+                    position, speed, action, gear
+                )
+                reward = float(custom_reward)  # Use ONLY custom reward, ignore TMRL reward
+                terminated = custom_terminated or terminated
+
+                # Accumulate individual components
+                for key in reward_component_totals:
+                    reward_component_totals[key] += reward_components[key]
+            else:
+                reward = float(tmrl_reward)  # Fall back to TMRL reward if no custom function
 
             rewards.append(reward)
             episode_reward += reward
+            speeds.append(speed)
 
             obs = next_obs
             done = terminated or truncated
@@ -406,67 +654,96 @@ class FullyLocalTrainer:
             'state_values': state_values,
             'positions': positions,
             'episode_length': step_count,
-            'episode_reward': episode_reward
+            'episode_reward': episode_reward,
+            'speeds': speeds,
+            'reward_components': reward_component_totals
         }
 
-    def train_on_episode(self, episode_data: Dict[str, Any]):
+    def train_on_episodes(self, episodes_data: List[Dict[str, Any]]):
         """
-        Train PPO for multiple epochs on one episode
+        Train PPO for multiple epochs on multiple collected episodes
 
         Args:
-            episode_data: Dictionary containing episode trajectory
+            episodes_data: List of episode dictionaries
         """
         print(f"\n{'='*60}")
         print(f"Training Update {self.update_count + 1}")
         print(f"{'='*60}")
 
-        episode_length = episode_data['episode_length']
-        episode_reward = episode_data['episode_reward']
+        # Calculate aggregate statistics
+        total_steps = sum(ep['episode_length'] for ep in episodes_data)
+        total_reward = sum(ep['episode_reward'] for ep in episodes_data)
+        mean_reward = total_reward / len(episodes_data)
 
-        print(f"  Episode length: {episode_length} steps")
-        print(f"  Episode reward: {episode_reward:.2f}")
+        print(f"  Training on {len(episodes_data)} episodes")
+        print(f"  Total steps: {total_steps}")
+        print(f"  Mean episode reward: {mean_reward:.2f}")
 
-        # Extract episode data
-        observations = episode_data['observations']
-        actions = torch.tensor(np.array(episode_data['actions']), dtype=torch.float32)
-        old_logprobs = torch.tensor(episode_data['logprobs'], dtype=torch.float32)
-        rewards = torch.tensor(episode_data['rewards'], dtype=torch.float32)
-        state_values = torch.tensor(episode_data['state_values'], dtype=torch.float32)
+        # Combine all episodes' data
+        all_observations = []
+        all_actions = []
+        all_logprobs = []
+        all_rewards = []
+        all_state_values = []
+        all_returns = []
+        all_advantages = []
 
-        # Add trajectory-based rewards if available
-        if self.trajectory_reward_fn is not None and 'positions' in episode_data:
-            print(f"Computing trajectory-based rewards...")
-            self.trajectory_reward_fn.reset()
-            trajectory_rewards = []
-
-            for position in episode_data['positions']:
-                traj_reward, _ = self.trajectory_reward_fn.compute_reward(position)
-                trajectory_rewards.append(traj_reward)
-
-            trajectory_rewards = torch.tensor(trajectory_rewards, dtype=torch.float32)
-            total_traj_reward = trajectory_rewards.sum().item()
-
-            # Combine original rewards with trajectory rewards
-            rewards = rewards + trajectory_rewards
-
-            print(f"Trajectory reward contribution: {total_traj_reward:.4f}")
-            print(f"Combined episode reward: {rewards.sum().item():.2f}")
-            episode_data['rewards'] = rewards.sum().item()
-
-        # Compute returns (discounted cumulative rewards)
-        returns = torch.zeros(episode_length)
         with torch.no_grad():
-            for t in range(episode_length - 1, -1, -1):
-                if t == episode_length - 1:
-                    returns[t] = rewards[t]
-                else:
-                    returns[t] = rewards[t] + self.hyper_params['gamma'] * returns[t + 1]
+            # Process each episode separately for returns and advantages
+            for episode_data in episodes_data:
+                episode_length = episode_data['episode_length']
 
-            # Compute advantages
-            advantages = returns - state_values
+                # Extract episode data
+                observations = episode_data['observations']
+                actions = torch.tensor(np.array(episode_data['actions']), dtype=torch.float32)
+                logprobs = torch.tensor(episode_data['logprobs'], dtype=torch.float32)
+                rewards = torch.tensor(episode_data['rewards'], dtype=torch.float32)
+                state_values = torch.tensor(episode_data['state_values'], dtype=torch.float32)
 
-        print(f"  Mean advantage: {advantages.mean():.4f}")
-        print(f"  Mean return: {returns.mean():.4f}")
+                # Compute returns and GAE advantages for this episode
+                returns = torch.zeros(episode_length)
+                advantages = torch.zeros(episode_length)
+
+                # Compute returns (for value function training)
+                for t in range(episode_length - 1, -1, -1):
+                    if t == episode_length - 1:
+                        returns[t] = rewards[t]
+                    else:
+                        returns[t] = rewards[t] + self.hyper_params['gamma'] * returns[t + 1]
+
+                # Compute GAE advantages
+                # GAE formula: A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
+                # where δ_t = r_t + γV(s_{t+1}) - V(s_t)
+                gae = 0
+                for t in range(episode_length - 1, -1, -1):
+                    if t == episode_length - 1:
+                        # Terminal state: V(s_{t+1}) = 0
+                        delta = rewards[t] - state_values[t]
+                    else:
+                        # δ_t = r_t + γV(s_{t+1}) - V(s_t)
+                        delta = rewards[t] + self.hyper_params['gamma'] * state_values[t + 1] - state_values[t]
+
+                    # GAE accumulation: A_t = δ_t + γλ * A_{t+1}
+                    gae = delta + self.hyper_params['gamma'] * self.hyper_params['gae_lambda'] * gae
+                    advantages[t] = gae
+
+                # Accumulate all data
+                all_observations.extend(observations)
+                all_actions.append(actions)
+                all_logprobs.append(logprobs)
+                all_rewards.append(rewards)
+                all_state_values.append(state_values)
+                all_returns.append(returns)
+                all_advantages.append(advantages)
+
+        # Concatenate all episodes
+        combined_actions = torch.cat(all_actions, dim=0)
+        combined_logprobs = torch.cat(all_logprobs, dim=0)
+        combined_returns = torch.cat(all_returns, dim=0)
+        combined_advantages = torch.cat(all_advantages, dim=0)
+
+        print(f"  Mean advantage: {combined_advantages.mean():.4f}")
+        print(f"  Mean return: {combined_returns.mean():.4f}")
 
         # Training metrics
         epoch_actor_losses = []
@@ -479,20 +756,20 @@ class FullyLocalTrainer:
         # Train for multiple epochs
         for epoch in range(self.hyper_params['epochs_per_update']):
             # Random permutation for mini-batches
-            rand_idxs = np.random.permutation(episode_length)
+            rand_idxs = np.random.permutation(total_steps)
 
             # Mini-batch updates
-            for batch_start in range(0, episode_length, self.hyper_params['batch_size']):
-                batch_end = min(batch_start + self.hyper_params['batch_size'], episode_length)
+            for batch_start in range(0, total_steps, self.hyper_params['batch_size']):
+                batch_end = min(batch_start + self.hyper_params['batch_size'], total_steps)
                 batch_idxs = rand_idxs[batch_start:batch_end]
 
                 # Extract batch
-                batch_obs = [observations[i] for i in batch_idxs]
+                batch_obs = [all_observations[i] for i in batch_idxs]
                 batch_obs_tensor = batch_obs_to_tensor(batch_obs, device=self.device)
-                batch_actions = actions[batch_idxs].to(self.device)
-                batch_old_logprobs = old_logprobs[batch_idxs].to(self.device)
-                batch_returns = returns[batch_idxs].to(self.device)
-                batch_advantages = advantages[batch_idxs].to(self.device)
+                batch_actions = combined_actions[batch_idxs].to(self.device)
+                batch_old_logprobs = combined_logprobs[batch_idxs].to(self.device)
+                batch_returns = combined_returns[batch_idxs].to(self.device)
+                batch_advantages = combined_advantages[batch_idxs].to(self.device)
 
                 # Normalize advantages
                 if self.hyper_params['norm_advantages']:
@@ -562,12 +839,33 @@ class FullyLocalTrainer:
 
         metrics = {
             'update': int(self.update_count),
-            'reward': float(episode_reward),
-            'steps': int(episode_length),
+            'reward': float(mean_reward),
+            'total_reward': float(total_reward),
+            'steps': int(total_steps / len(episodes_data)),  # Mean episode length
+            'total_steps': int(total_steps),
+            'num_episodes': len(episodes_data),
             'actor_loss': float(np.mean(epoch_actor_losses)),
             'critic_loss': float(np.mean(epoch_critic_losses)),
             'total_loss': float(np.mean(epoch_total_losses))
         }
+
+        # Add averaged reward components to metrics if available
+        if 'reward_components' in episodes_data[0]:
+            avg_comps = {key: 0.0 for key in episodes_data[0]['reward_components'].keys()}
+            for ep_data in episodes_data:
+                for key, value in ep_data['reward_components'].items():
+                    avg_comps[key] += value
+            for key in avg_comps:
+                avg_comps[key] /= len(episodes_data)
+
+            metrics['reward_components'] = {
+                'progress_reward': float(avg_comps['progress_reward']),
+                'effective_speed_reward': float(avg_comps['effective_speed_reward']),
+                'gas_bonus': float(avg_comps['gas_bonus']),
+                'reverse_tax': float(avg_comps['reverse_tax']),
+                'parking_fine': float(avg_comps['parking_fine'])
+            }
+
         self.training_history.append(metrics)
 
         print(f"\n  Training complete:")
@@ -575,9 +873,9 @@ class FullyLocalTrainer:
         print(f"    Critic loss: {metrics['critic_loss']:.4f}")
         print(f"    Total loss: {metrics['total_loss']:.4f}")
 
-        # Save checkpoint if good reward
-        if episode_reward > 200:
-            checkpoint_name = f"Y{episode_reward:.2f}RewardRacer{self.update_count}Update.pt"
+        # Save checkpoint if good mean reward
+        if mean_reward > 200:
+            checkpoint_name = f"Y{mean_reward:.2f}RewardRacer{self.update_count}Update.pt"
             checkpoint_path = os.path.join(self.checkpoint_dir, checkpoint_name)
             torch.save(self.agent.state_dict(), checkpoint_path)
             print(f"  ✓ Checkpoint saved: {checkpoint_name}")
@@ -596,6 +894,11 @@ class FullyLocalTrainer:
             }, checkpoint_path)
             print(f"  ✓ Periodic checkpoint saved: {checkpoint_name}")
 
+        # Save training metadata to JSON after each update
+        metadata_path = self.save_metadata_to_json()
+        if self.update_count == 1 or self.update_count % 10 == 0:
+            print(f"  ✓ Training metadata saved: {os.path.basename(metadata_path)}")
+
         print(f"{'='*60}\n")
 
         # Synchronize CUDA if using GPU
@@ -608,17 +911,107 @@ class FullyLocalTrainer:
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
         if 'agent_state_dict' in checkpoint:
-            # Full checkpoint with optimizer states
+            # Checkpoint with agent state dict (may or may not have optimizer states)
             self.agent.load_state_dict(checkpoint['agent_state_dict'])
-            self.policy_optim.load_state_dict(checkpoint['policy_optim_state_dict'])
-            self.critic_optim.load_state_dict(checkpoint['critic_optim_state_dict'])
-            self.update_count = checkpoint['update_count']
-            self.training_history = checkpoint['training_history']
-            print(f"  ✓ Loaded checkpoint from update {self.update_count}")
+            print(f"  [OK] Loaded agent state dict")
+
+            # Try to load optimizer states if available
+            if 'policy_optim_state_dict' in checkpoint:
+                self.policy_optim.load_state_dict(checkpoint['policy_optim_state_dict'])
+                print(f"  [OK] Loaded policy optimizer state")
+            else:
+                print(f"  [INFO] Policy optimizer state not found, using fresh optimizer")
+
+            if 'critic_optim_state_dict' in checkpoint:
+                self.critic_optim.load_state_dict(checkpoint['critic_optim_state_dict'])
+                print(f"  [OK] Loaded critic optimizer state")
+            else:
+                print(f"  [INFO] Critic optimizer state not found, using fresh optimizer")
+
+            # Load training metadata if available
+            if 'update_count' in checkpoint:
+                self.update_count = checkpoint['update_count']
+                print(f"  [OK] Resuming from update {self.update_count}")
+            else:
+                print(f"  [INFO] Update count not found, starting from 0")
+
+            if 'training_history' in checkpoint:
+                self.training_history = checkpoint['training_history']
+                print(f"  [OK] Loaded training history ({len(self.training_history)} entries)")
+            else:
+                print(f"  [INFO] Training history not found, starting fresh")
+
         else:
-            # Simple checkpoint with just model weights
+            # Simple checkpoint with just model weights (state dict directly)
             self.agent.load_state_dict(checkpoint)
-            print(f"  ✓ Loaded model weights")
+            print(f"  [OK] Loaded model weights (no metadata)")
+
+        print(f"  [OK] Checkpoint loaded successfully!")
+
+    def save_metadata_to_json(self, filepath: Optional[str] = None):
+        """
+        Save training metadata to a JSON file
+
+        Args:
+            filepath: Path to save JSON file. If None, saves to checkpoint_dir/training_metadata.json
+        """
+        if filepath is None:
+            filepath = os.path.join(self.checkpoint_dir, "training_metadata.json")
+
+        # Prepare metadata dictionary
+        metadata = {
+            'training_info': {
+                'update_count': int(self.update_count),
+                'total_steps': int(self.total_steps),
+                'device': str(self.device),
+                'max_episode_steps': int(self.max_episode_steps)
+            },
+            'hyperparameters': self.hyper_params,
+            'training_history': self.training_history,
+            'model_info': {
+                'policy_parameters': sum(p.numel() for p in self.agent.policy.parameters()),
+                'critic_parameters': sum(p.numel() for p in self.agent.critic.parameters())
+            }
+        }
+
+        # Add trajectory info if available
+        if self.trajectory_reward_fn is not None:
+            metadata['trajectory_info'] = {
+                'enabled': True,
+                'scale': float(self.trajectory_reward_fn.scale),
+                'max_dist': float(self.trajectory_reward_fn.max_dist),
+                'trajectory_length': len(self.trajectory_reward_fn.trajectory),
+                'current_failure_countdown': int(self.trajectory_reward_fn.failure_countdown),
+                'current_min_steps': int(self.trajectory_reward_fn.min_steps)
+            }
+        else:
+            metadata['trajectory_info'] = {
+                'enabled': False
+            }
+
+        # Add curriculum learning info
+        metadata['curriculum_learning'] = self.curriculum_config
+
+        # Calculate summary statistics if training history exists
+        if self.training_history:
+            rewards = [h['reward'] for h in self.training_history]
+            steps = [h['steps'] for h in self.training_history]
+            actor_losses = [h['actor_loss'] for h in self.training_history]
+
+            metadata['summary_statistics'] = {
+                'mean_reward': float(np.mean(rewards)),
+                'max_reward': float(np.max(rewards)),
+                'min_reward': float(np.min(rewards)),
+                'mean_episode_length': float(np.mean(steps)),
+                'mean_actor_loss': float(np.mean(actor_losses)),
+                'total_episodes': len(self.training_history)
+            }
+
+        # Save to JSON file
+        with open(filepath, 'w') as f:
+            json.dump(metadata, f, indent=2)
+
+        return filepath
 
     def train_loop(self, num_updates: int = 10000):
         """
@@ -634,7 +1027,6 @@ class FullyLocalTrainer:
         print(f"Number of updates: {num_updates}")
         print(f"Max episode steps: {self.max_episode_steps}")
         print(f"Checkpoint directory: {self.checkpoint_dir}")
-        print(f"Trajectory-based rewards: {'ENABLED' if self.trajectory_reward_fn else 'DISABLED'}")
         print(f"{'='*60}\n")
 
         # Training loop
@@ -645,20 +1037,50 @@ class FullyLocalTrainer:
 
             start_time = time.time()
 
-            # 1. Collect episode locally
-            episode_data = self.collect_episode()
+            # Update curriculum learning parameters
+            self.update_curriculum()
 
-            # 2. Train on episode (synchronous - no network delay!)
-            self.train_on_episode(episode_data)
+            # 1. Collect multiple episodes locally
+            print(f"\nCollecting {self.hyper_params['episodes_per_update']} episodes...")
+            episodes_data = []
+            for ep in range(self.hyper_params['episodes_per_update']):
+                episode_data = self.collect_episode()
+                episodes_data.append(episode_data)
+                print(f"  Episode {ep+1}/{self.hyper_params['episodes_per_update']}: {episode_data['episode_length']} steps, reward: {episode_data['episode_reward']:.2f}")
+
+            # 2. Train on collected episodes (synchronous - no network delay!)
+            self.train_on_episodes(episodes_data)
 
             elapsed = time.time() - start_time
 
+            # Calculate aggregate statistics
+            total_reward = sum(ep['episode_reward'] for ep in episodes_data)
+            mean_reward = total_reward / len(episodes_data)
+            total_episode_steps = sum(ep['episode_length'] for ep in episodes_data)
+            mean_episode_length = total_episode_steps / len(episodes_data)
+
             print(f"\n{'='*60}")
             print(f"Update {self.update_count} complete")
-            print(f"  Episode reward: {episode_data['episode_reward']:.2f}")
-            print(f"  Episode length: {episode_data['episode_length']} steps")
+            print(f"  Episodes collected: {len(episodes_data)}")
+            print(f"  Mean episode reward: {mean_reward:.2f} (total: {total_reward:.2f})")
+            print(f"  Mean episode length: {mean_episode_length:.0f} steps (total: {total_episode_steps})")
             print(f"  Total steps: {self.total_steps}")
             print(f"  Update time: {elapsed:.1f}s")
+
+            # Show aggregate reward component summary if available
+            if 'reward_components' in episodes_data[0]:
+                # Average components across all episodes
+                avg_comps = {key: 0.0 for key in episodes_data[0]['reward_components'].keys()}
+                for ep_data in episodes_data:
+                    for key, value in ep_data['reward_components'].items():
+                        avg_comps[key] += value
+                for key in avg_comps:
+                    avg_comps[key] /= len(episodes_data)
+
+                print(f"\n  Average reward breakdown:")
+                print(f"    Progress: {avg_comps['progress_reward']:.2f} | Speed: {avg_comps['effective_speed_reward']:.2f} | Gas: {avg_comps['gas_bonus']:.2f}")
+                print(f"    Reverse: -{avg_comps['reverse_tax']:.2f} | Parking: -{avg_comps['parking_fine']:.2f}")
+
             print(f"{'='*60}")
 
         print(f"\n{'='*60}")
@@ -677,7 +1099,11 @@ class FullyLocalTrainer:
             'training_history': self.training_history,
             'hyper_params': self.hyper_params
         }, final_checkpoint_path)
-        print(f"✓ Final checkpoint saved: {final_checkpoint_path}\n")
+        print(f"✓ Final checkpoint saved: {final_checkpoint_path}")
+
+        # Save final training metadata
+        metadata_path = self.save_metadata_to_json()
+        print(f"✓ Final training metadata saved: {metadata_path}\n")
 
 
 def main():
@@ -732,16 +1158,16 @@ def main():
     parser.add_argument('--entropy-coef', type=float, default=0.1, help='Entropy coefficient')
     parser.add_argument('--batch-size', type=int, default=128, help='Mini-batch size')
     parser.add_argument('--epochs-per-update', type=int, default=50, help='Epochs per update')
+    parser.add_argument('--episodes-per-update', type=int, default=4, help='Episodes to collect per update')
     parser.add_argument('--hidden-dim', type=int, default=32, help='Hidden layer dimension')
     parser.add_argument('--grad-clip-val', type=float, default=0.5, help='Gradient clipping value')
+    parser.add_argument('--gae-lambda', type=float, default=0.95, help='GAE lambda for advantage estimation (0.0=no GAE, 1.0=Monte Carlo)')
 
     # Trajectory reward parameters
     parser.add_argument('--reward-scale', type=float, default=0.01, help='Trajectory reward scale')
     parser.add_argument('--max-dist-from-traj', type=float, default=60.0, help='Max distance from trajectory')
-    parser.add_argument('--check-forward', type=int, default=10, help='Check forward positions')
+    parser.add_argument('--check-forward', type=int, default=1000, help='Check forward positions (prevents cutting track)')
     parser.add_argument('--check-backward', type=int, default=10, help='Check backward positions')
-    parser.add_argument('--failure-countdown', type=int, default=10, help='Failure countdown')
-    parser.add_argument('--min-steps-before-failure', type=int, default=70, help='Min steps before failure')
 
     args = parser.parse_args()
 
@@ -759,14 +1185,15 @@ def main():
         entropy_coef=args.entropy_coef,
         batch_size=args.batch_size,
         epochs_per_update=args.epochs_per_update,
+        episodes_per_update=args.episodes_per_update,
         hidden_dim=args.hidden_dim,
         grad_clip_val=args.grad_clip_val,
+        gae_lambda=args.gae_lambda,
         reward_scale=args.reward_scale,
         max_dist_from_traj=args.max_dist_from_traj,
         check_forward=args.check_forward,
-        check_backward=args.check_backward,
-        failure_countdown=args.failure_countdown,
-        min_steps_before_failure=args.min_steps_before_failure
+        check_backward=args.check_backward
+        # Using function defaults for curriculum learning parameters
     )
 
     # Load checkpoint if provided
@@ -790,10 +1217,21 @@ def main():
             'hyper_params': trainer.hyper_params
         }, interrupt_checkpoint_path)
         print(f"✓ Interrupt checkpoint saved: {interrupt_checkpoint_path}")
+
+        # Save training metadata
+        metadata_path = trainer.save_metadata_to_json()
+        print(f"✓ Training metadata saved: {metadata_path}")
     except Exception as e:
         print(f"\n\n✗ Training failed with error: {e}")
         import traceback
         traceback.print_exc()
+
+        # Save training metadata even on error
+        try:
+            metadata_path = trainer.save_metadata_to_json()
+            print(f"✓ Training metadata saved: {metadata_path}")
+        except Exception as meta_error:
+            print(f"✗ Failed to save metadata: {meta_error}")
 
 
 if __name__ == "__main__":
