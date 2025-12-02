@@ -79,6 +79,28 @@ def batch_obs_to_tensor(observations, device='cpu'):
 
     return (speed_t, gear_t, rpm_t, images_t, act1_t, act2_t)
 
+
+def index_tensor_tuple(tensor_tuple, indices):
+    """
+    Index into a tuple of tensors
+
+    Args:
+        tensor_tuple: tuple of tensors (speed, gear, rpm, images, act1, act2)
+        indices: indices to extract
+
+    Returns:
+        tuple of indexed tensors
+    """
+    speed_t, gear_t, rpm_t, images_t, act1_t, act2_t = tensor_tuple
+    return (
+        speed_t[indices],
+        gear_t[indices],
+        rpm_t[indices],
+        images_t[indices],
+        act1_t[indices],
+        act2_t[indices]
+    )
+
 class RewardFunction:
     def __init__(self, trajectory, scale, max_dist,
                  check_forward, check_backward,
@@ -517,7 +539,7 @@ class FullyLocalTrainer:
                     check_backward=check_backward,
                     failure_countdown=initial_failure_countdown,
                     min_steps=initial_min_steps,
-                    debug=False  # Disable debug logging (re-enable for diagnosis)
+                    debug=False
                 )
 
                 print(f"✓ Custom reward function initialized")
@@ -541,8 +563,6 @@ class FullyLocalTrainer:
             'final_min_steps': final_min_steps,
             'curriculum_updates': curriculum_updates
         }
-
-        # Statistics
         self.update_count = 0
         self.total_steps = 0
         self.training_history = []
@@ -717,7 +737,24 @@ class FullyLocalTrainer:
         elapsed = time.time() - start_time
         self.total_steps += step_count
 
+        # Determine if episode was truly terminated (failed) or just truncated (time limit)
+        # terminated=True means: agent failed (custom reward termination or env termination)
+        # terminated=False with done=True means: truncated (hit max_episode_steps or env truncation)
+        is_true_termination = terminated
+
+        # Compute final state value for bootstrapping if episode was truncated
+        final_state_value = 0.0
+        if not is_true_termination:
+            # Episode was truncated (not failed), bootstrap from final state
+            with torch.no_grad():
+                final_obs_tensor = env_obs_to_tensor(obs, device=self.device)
+                final_state_value = self.agent.critic(final_obs_tensor)[0, 0].cpu().item()
+
         print(f"  ✓ Episode collected: {step_count} steps, reward: {episode_reward:.2f}, time: {elapsed:.1f}s")
+        if is_true_termination:
+            print(f"    Episode ended: TERMINATED (agent failed)")
+        else:
+            print(f"    Episode ended: TRUNCATED (time limit, bootstrapping with V={final_state_value:.2f})")
 
         return {
             'observations': observations,
@@ -729,7 +766,9 @@ class FullyLocalTrainer:
             'episode_length': step_count,
             'episode_reward': episode_reward,
             'speeds': speeds,
-            'reward_components': reward_component_totals
+            'reward_components': reward_component_totals,
+            'terminated': is_true_termination,  # True if agent failed, False if truncated
+            'final_state_value': final_state_value  # V(s_final) for bootstrapping truncated episodes
         }
 
     def train_on_episodes(self, episodes_data: List[Dict[str, Any]]):
@@ -772,15 +811,19 @@ class FullyLocalTrainer:
                 logprobs = torch.tensor(episode_data['logprobs'], dtype=torch.float32)
                 rewards = torch.tensor(episode_data['rewards'], dtype=torch.float32)
                 state_values = torch.tensor(episode_data['state_values'], dtype=torch.float32)
+                terminated = episode_data['terminated']
+                final_state_value = episode_data['final_state_value']
 
                 # Compute returns and GAE advantages for this episode
                 returns = torch.zeros(episode_length)
                 advantages = torch.zeros(episode_length)
 
                 # Compute returns (for value function training)
+                # If episode was truncated, bootstrap from final state value
+                next_return = final_state_value if not terminated else 0.0
                 for t in range(episode_length - 1, -1, -1):
                     if t == episode_length - 1:
-                        returns[t] = rewards[t]
+                        returns[t] = rewards[t] + self.hyper_params['gamma'] * next_return
                     else:
                         returns[t] = rewards[t] + self.hyper_params['gamma'] * returns[t + 1]
 
@@ -788,10 +831,11 @@ class FullyLocalTrainer:
                 # GAE formula: A_t = δ_t + (γλ)δ_{t+1} + (γλ)²δ_{t+2} + ...
                 # where δ_t = r_t + γV(s_{t+1}) - V(s_t)
                 gae = 0
+                next_value = final_state_value if not terminated else 0.0
                 for t in range(episode_length - 1, -1, -1):
                     if t == episode_length - 1:
-                        # Terminal state: V(s_{t+1}) = 0
-                        delta = rewards[t] - state_values[t]
+                        # Last step: bootstrap from final_state_value if truncated, else 0
+                        delta = rewards[t] + self.hyper_params['gamma'] * next_value - state_values[t]
                     else:
                         # δ_t = r_t + γV(s_{t+1}) - V(s_t)
                         delta = rewards[t] + self.hyper_params['gamma'] * state_values[t + 1] - state_values[t]
@@ -812,11 +856,17 @@ class FullyLocalTrainer:
         # Concatenate all episodes
         combined_actions = torch.cat(all_actions, dim=0)
         combined_logprobs = torch.cat(all_logprobs, dim=0)
+        combined_state_values = torch.cat(all_state_values, dim=0)
         combined_returns = torch.cat(all_returns, dim=0)
         combined_advantages = torch.cat(all_advantages, dim=0)
 
         print(f"  Mean advantage: {combined_advantages.mean():.4f}")
         print(f"  Mean return: {combined_returns.mean():.4f}")
+
+        # Convert all observations to tensors ONCE (performance optimization)
+        # This avoids repeated conversions in the mini-batch loop
+        print(f"  Converting observations to tensors...")
+        all_observations_tensor = batch_obs_to_tensor(all_observations, device=self.device)
 
         # Training metrics
         epoch_actor_losses = []
@@ -836,9 +886,8 @@ class FullyLocalTrainer:
                 batch_end = min(batch_start + self.hyper_params['batch_size'], total_steps)
                 batch_idxs = rand_idxs[batch_start:batch_end]
 
-                # Extract batch
-                batch_obs = [all_observations[i] for i in batch_idxs]
-                batch_obs_tensor = batch_obs_to_tensor(batch_obs, device=self.device)
+                # Extract batch (using pre-converted tensors for performance)
+                batch_obs_tensor = index_tensor_tuple(all_observations_tensor, batch_idxs)
                 batch_actions = combined_actions[batch_idxs].to(self.device)
                 batch_old_logprobs = combined_logprobs[batch_idxs].to(self.device)
                 batch_returns = combined_returns[batch_idxs].to(self.device)
@@ -849,8 +898,10 @@ class FullyLocalTrainer:
                     batch_advantages = (batch_advantages - batch_advantages.mean()) / (batch_advantages.std() + 1e-8)
 
                 # ========== PPO Actor Loss ==========
-                # Get new log probabilities
-                batch_new_logprobs = self.agent.policy.get_action_log_prob(batch_obs_tensor, batch_actions)
+                # Get distribution for both log probabilities and entropy
+                dist = self.agent.policy(batch_obs_tensor)
+                batch_new_logprobs = dist.log_prob(batch_actions)
+                entropy = dist.entropy()
 
                 # Importance sampling ratio
                 log_ratio = batch_new_logprobs - batch_old_logprobs
@@ -865,12 +916,34 @@ class FullyLocalTrainer:
                 ) * batch_advantages
                 ppo_loss = torch.max(unclipped_obj, clipped_obj).sum() / len(batch_idxs) # max because we are calculating as loss so sign flips
 
-                # ========== Critic Loss ==========
+                # ========== Critic Loss (with clipping) ==========
+                # Get old state values for clipping
+                batch_old_values = combined_state_values[batch_idxs].to(self.device)
+
+                # Get new state values
                 new_values = self.agent.critic(batch_obs_tensor).squeeze()
-                v_loss = ((new_values - batch_returns) ** 2).sum() / len(batch_idxs)
+
+                # Clipped value loss (PPO2 style)
+                # Prevent critic from changing too drastically
+                v_loss_unclipped = (new_values - batch_returns) ** 2
+
+                # Clip new values around old values
+                new_values_clipped = batch_old_values + torch.clamp(
+                    new_values - batch_old_values,
+                    -self.hyper_params['clip_coef'],
+                    self.hyper_params['clip_coef']
+                )
+                v_loss_clipped = (new_values_clipped - batch_returns) ** 2
+
+                # Take max of clipped and unclipped loss
+                v_loss = torch.max(v_loss_unclipped, v_loss_clipped).sum() / len(batch_idxs)
+
+                # ========== Entropy Bonus ==========
+                # Maximize entropy to encourage exploration (subtract from loss)
+                entropy_mean = entropy.mean()
 
                 # ========== Combined Loss ==========
-                total_loss = ppo_loss + self.hyper_params['critic_coef'] * v_loss
+                total_loss = ppo_loss + self.hyper_params['critic_coef'] * v_loss - self.hyper_params['entropy_coef'] * entropy_mean
 
                 # ========== Optimization ==========
                 self.policy_optim.zero_grad()
@@ -878,10 +951,10 @@ class FullyLocalTrainer:
 
                 total_loss.backward()
 
-                # Gradient clipping
-                nn.utils.clip_grad_value_(
+                # Gradient clipping using global norm (as per PPO2 standard)
+                nn.utils.clip_grad_norm_(
                     self.agent.policy.parameters(),
-                    clip_value=self.hyper_params['grad_clip_val']
+                    max_norm=self.hyper_params['grad_clip_val']
                 )
 
                 # Handle NaN gradients
@@ -890,9 +963,9 @@ class FullyLocalTrainer:
                         mask = torch.isnan(param.grad)
                         param.grad[mask] = 0.0
 
-                nn.utils.clip_grad_value_(
+                nn.utils.clip_grad_norm_(
                     self.agent.critic.parameters(),
-                    clip_value=self.hyper_params['grad_clip_val']
+                    max_norm=self.hyper_params['grad_clip_val']
                 )
 
                 self.policy_optim.step()
