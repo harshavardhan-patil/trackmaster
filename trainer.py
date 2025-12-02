@@ -99,7 +99,8 @@ class RewardFunction:
         self.failure_counter = 0
         self.prev_position = None
         self.last_progress_position = None  # Track position for distance-based failure detection
-        self.distance_since_last_progress = 0.0 
+        self.distance_since_last_progress = 0.0
+        self.prev_steering = 0.0  # Track previous steering for smoothness penalty 
 
     def compute_reward(self, position, speed, action, gear=1):
         """
@@ -177,7 +178,7 @@ class RewardFunction:
             print(f"  Progress: (best_idx={best_idx} - cur_idx={self.cur_idx}) * scale={self.scale}")
             print(f"  Progress reward (raw): {progress_reward:.4f}")
 
-        # B. Effective Speed Reward (Velocity along the line)
+        # B. Effective Speed Reward (Velocity along the line) - ENHANCED
         alignment = 0.0
         norm_track = np.linalg.norm(track_vec)
         norm_car = np.linalg.norm(car_vec)
@@ -186,10 +187,13 @@ class RewardFunction:
             # Cosine similarity
             alignment = np.dot(track_vec, car_vec) / (norm_track * norm_car)
 
-        # Scale down speed (0-1000) to reasonable reward size (e.g. 0-2.0)
-        # Only reward speed if alignment is positive
+        # Enhanced speed reward with bonus for sustained high speed when aligned
         if alignment > 0:
-            effective_speed_reward = (speed * alignment) * 0.001
+            effective_speed_reward = (speed * alignment) * 0.003
+
+            # Bonus for sustained high speed when well-aligned
+            if speed > 120 and alignment > 0.8:
+                effective_speed_reward += 0.3 * self.scale
         else:
             effective_speed_reward = 0.0
 
@@ -200,20 +204,62 @@ class RewardFunction:
             print(f"  Speed: {speed:.2f} km/h")
             print(f"  Speed reward (raw): {effective_speed_reward:.4f}")
 
-        # C. Gas Bias
+        # C. Distance-from-Centerline Penalty
+        # Penalize being too far from the racing line
+        lateral_distance = min_dist
+        centerline_penalty = 0.0
+        if lateral_distance > self.max_dist * 0.5:  # If more than halfway to track edge
+            centerline_penalty = (lateral_distance / self.max_dist) * 0.1 * self.scale
+
+        # D. Wall Collision Penalty
+        # Heavily penalize being very close to track boundaries
+        wall_collision_penalty = 0.0
+        if min_dist > self.max_dist * 0.8:  # Very close to track edge
+            wall_collision_penalty = 0.2 * self.scale
+
+        # E. Steering Smoothness Penalty (with Curvature Awareness)
+        # Calculate track curvature to reduce penalty in curves
+        curvature = 0.0
+        curvature_weight = 1.0
+        if lookahead > 1:
+            try:
+                vec1 = self.trajectory[best_idx + 1] - self.trajectory[best_idx]
+                vec2 = self.trajectory[best_idx + lookahead] - self.trajectory[best_idx + 1]
+                cross_product = np.cross(vec1, vec2)
+                curvature = np.linalg.norm(cross_product) / (np.linalg.norm(vec1) ** 3 + 1e-6)
+
+                # Reduce penalty in curves (higher curvature = lower weight)
+                curvature_weight = 1.0 / (1.0 + curvature * 10.0)
+            except (IndexError, ValueError):
+                # If we can't calculate curvature, use default weight
+                curvature_weight = 1.0
+
+        # Penalize rapid steering changes
+        steering_change = abs(action[0] - self.prev_steering)
+        steering_jerk_penalty = steering_change * 0.05 * self.scale * curvature_weight
+
+        # Update previous steering
+        self.prev_steering = action[0]
+
+        if self.debug and self.step_counter % 100 == 0:
+            print(f"  Centerline penalty: {centerline_penalty:.4f} (lateral dist: {lateral_distance:.2f}m)")
+            print(f"  Wall collision penalty: {wall_collision_penalty:.4f}")
+            print(f"  Steering jerk penalty: {steering_jerk_penalty:.4f} (change: {steering_change:.2f}, curvature_weight: {curvature_weight:.2f})")
+
+        # F. Gas Bias
         # If throttle (action[1]) > 0.8
         gas_bonus = 0.0
         if action[1] > 0.8:
             gas_bonus = 0.5 * self.scale
 
-        # D. Reverse Tax
+        # G. Reverse Tax
         # Penalty for reversing to avoid reward hacking
         # gear == 0 means reverse gear
         reverse_tax = 0.0
         if gear == 0:
             reverse_tax = speed * self.scale
 
-        # E. Parking Fine
+        # H. Parking Fine
         # If we are 2 seconds into the race and stopped, punish idleness.
         parking_fine = 0.0
         if self.step_counter > 40 and abs(speed) < 1.0:
@@ -223,7 +269,9 @@ class RewardFunction:
             print(f"  Gas bonus: {gas_bonus:.4f} (throttle={action[1]:.2f})")
             print(f"  Reverse tax: {reverse_tax:.4f} (gear={gear})")
             print(f"  Parking fine: {parking_fine:.4f}")
-            total_raw = progress_reward + effective_speed_reward + gas_bonus - reverse_tax - parking_fine
+            total_raw = (progress_reward + effective_speed_reward + gas_bonus
+                        - centerline_penalty - wall_collision_penalty - steering_jerk_penalty
+                        - reverse_tax - parking_fine)
             print(f"  Total (alpha): {total_raw:.4f}")
 
         # 4. TOTAL & UPDATES
@@ -231,6 +279,9 @@ class RewardFunction:
         total_reward = (progress_reward
                         + effective_speed_reward
                         + gas_bonus
+                        - centerline_penalty
+                        - wall_collision_penalty
+                        - steering_jerk_penalty
                         - reverse_tax
                         - parking_fine)
 
@@ -239,16 +290,19 @@ class RewardFunction:
             'progress_reward': progress_reward,
             'effective_speed_reward': effective_speed_reward,
             'gas_bonus': gas_bonus,
+            'centerline_penalty': centerline_penalty,
+            'wall_collision_penalty': wall_collision_penalty,
+            'steering_jerk_penalty': steering_jerk_penalty,
             'reverse_tax': reverse_tax,
             'parking_fine': parking_fine
         }
 
-        # Update state
-        self.cur_idx = best_idx
+        # Update previous position
         self.prev_position = position.copy()
 
         # Continue is step count less than exploratory min steps
         if self.step_counter < self.min_steps:
+            self.cur_idx = best_idx  # Update cur_idx even during min_steps
             return total_reward, False, reward_components
 
         # Failure check (Stuck logic)
@@ -279,7 +333,20 @@ class RewardFunction:
 
         # Hard terminate if hopelessly lost
         if min_dist > (self.max_dist * 2.0):
+            if not terminated:  # Only log if this is the termination cause
+                print(f"\n[TERMINATION] Step {self.step_counter}: TOO FAR FROM TRACK")
+                print(f"  Distance from track: {min_dist:.2f}m (max allowed: {self.max_dist * 2.0:.2f}m)")
+                print(f"  Position: {position}")
+                print(f"  Checkpoint: {best_idx}")
             terminated = True
+        elif terminated:
+            print(f"\n[TERMINATION] Step {self.step_counter}: NO PROGRESS")
+            print(f"  Failure counter: {self.failure_counter} > {self.failure_countdown}")
+            print(f"  Last checkpoint: {self.last_checkpoint}")
+            print(f"  Distance from track: {min_dist:.2f}m")
+
+        # Update cur_idx progress check
+        self.cur_idx = best_idx
 
         return total_reward, terminated, reward_components
 
@@ -296,6 +363,7 @@ class RewardFunction:
         self.prev_position = None
         self.last_progress_position = None
         self.distance_since_last_progress = 0.0
+        self.prev_steering = 0.0
 
 
 class FullyLocalTrainer:
@@ -303,7 +371,7 @@ class FullyLocalTrainer:
 
     def __init__(
         self,
-        max_episode_steps: int = 2400,
+        max_episode_steps: int = 1800,
         checkpoint_dir: str = "./checkpoints",
         trajectory_path: Optional[str] = None,
         device: Optional[str] = None,
@@ -325,7 +393,7 @@ class FullyLocalTrainer:
         avg_ray: float = 400.0,
         # Trajectory reward parameters
         reward_scale: float = 0.1,
-        max_dist_from_traj: float = 60.0,
+        max_dist_from_traj: float = 30.0,
         check_forward: int = 1000,
         check_backward: int = 10,
         # Curriculum learning parameters
@@ -405,7 +473,6 @@ class FullyLocalTrainer:
             'avg_ray': avg_ray
         }
 
-        # Initialize TMRL environment
         print("Initializing TMRL environment...")
         self.env = tmrl.get_environment()
         print(f"Observation Space: {self.env.observation_space}")
@@ -415,7 +482,6 @@ class FullyLocalTrainer:
         self.observation_space = 49161  # TMRL default
         self.action_space = 3  # Steering, throttle, brake
 
-        # Initialize agent
         print("Initializing agent...")
         self.agent = Agent(action_space=self.action_space).to(self.device)
 
@@ -451,7 +517,7 @@ class FullyLocalTrainer:
                     check_backward=check_backward,
                     failure_countdown=initial_failure_countdown,
                     min_steps=initial_min_steps,
-                    debug=False  # Disable debug logging
+                    debug=False  # Disable debug logging (re-enable for diagnosis)
                 )
 
                 print(f"✓ Custom reward function initialized")
@@ -547,6 +613,10 @@ class FullyLocalTrainer:
         """
         print("\n  Collecting episode...")
 
+        # Log curriculum parameters
+        if self.trajectory_reward_fn is not None:
+            print(f"    Curriculum: min_steps={self.trajectory_reward_fn.min_steps}, failure_countdown={self.trajectory_reward_fn.failure_countdown}")
+
         # Buffers for episode data
         observations = []
         actions = []
@@ -561,6 +631,9 @@ class FullyLocalTrainer:
             'progress_reward': 0.0,
             'effective_speed_reward': 0.0,
             'gas_bonus': 0.0,
+            'centerline_penalty': 0.0,
+            'wall_collision_penalty': 0.0,
+            'steering_jerk_penalty': 0.0,
             'reverse_tax': 0.0,
             'parking_fine': 0.0
         }
@@ -588,8 +661,8 @@ class FullyLocalTrainer:
 
             # Extract position, speed, and gear for custom reward function
             # Observation format: (speed, gear, rpm, images, act1, act2)
-            speed = float(obs[0]) if hasattr(obs[0], '__iter__') else obs[0]
-            gear = float(obs[1]) if hasattr(obs[1], '__iter__') else obs[1]
+            speed = float(obs[0].item()) if hasattr(obs[0], 'item') else float(obs[0])
+            gear = float(obs[1].item()) if hasattr(obs[1], 'item') else float(obs[1])
             position = None
 
             if self.trajectory_reward_fn is not None:
@@ -862,6 +935,9 @@ class FullyLocalTrainer:
                 'progress_reward': float(avg_comps['progress_reward']),
                 'effective_speed_reward': float(avg_comps['effective_speed_reward']),
                 'gas_bonus': float(avg_comps['gas_bonus']),
+                'centerline_penalty': float(avg_comps['centerline_penalty']),
+                'wall_collision_penalty': float(avg_comps['wall_collision_penalty']),
+                'steering_jerk_penalty': float(avg_comps['steering_jerk_penalty']),
                 'reverse_tax': float(avg_comps['reverse_tax']),
                 'parking_fine': float(avg_comps['parking_fine'])
             }
@@ -1078,8 +1154,9 @@ class FullyLocalTrainer:
                     avg_comps[key] /= len(episodes_data)
 
                 print(f"\n  Average reward breakdown:")
-                print(f"    Progress: {avg_comps['progress_reward']:.2f} | Speed: {avg_comps['effective_speed_reward']:.2f} | Gas: {avg_comps['gas_bonus']:.2f}")
-                print(f"    Reverse: -{avg_comps['reverse_tax']:.2f} | Parking: -{avg_comps['parking_fine']:.2f}")
+                print(f"    Rewards: Progress: {avg_comps['progress_reward']:.2f} | Speed: {avg_comps['effective_speed_reward']:.2f} | Gas: {avg_comps['gas_bonus']:.2f}")
+                print(f"    Penalties: Centerline: -{avg_comps['centerline_penalty']:.2f} | Wall: -{avg_comps['wall_collision_penalty']:.2f} | Steering: -{avg_comps['steering_jerk_penalty']:.2f}")
+                print(f"    Other: Reverse: -{avg_comps['reverse_tax']:.2f} | Parking: -{avg_comps['parking_fine']:.2f}")
 
             print(f"{'='*60}")
 

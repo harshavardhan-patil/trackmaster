@@ -14,9 +14,6 @@ class Actor(nn.Module):
 
         # CNN backbone
         self.backbone = TrackMasterCNN()
-
-        # Output layers for action distribution
-        # The backbone outputs 256 features
         mlp_output_size = self.backbone.mlp_layers[-1]
 
         # Action mean layer (outputs 3 actions: steering, throttle, brake)
@@ -56,7 +53,6 @@ class Actor(nn.Module):
         Returns:
             MultivariateNormal distribution over actions
         """
-        # Forward through CNN backbone
         features = self.backbone(observation)
 
         # Get action means
@@ -67,21 +63,15 @@ class Actor(nn.Module):
           torch.tanh(means[:, 2])      # Steering: -1 to 1
       ], dim=1)
 
-        # Get log variance
         log_vars = self.actor_logvar(features)
         # Clamp log_variance to a safe range
         # min -20 (std ~0.00004), max 2 (std ~2.7)
         log_vars = torch.clamp(log_vars, min=-20, max=2)
         
-        # Calculate variance (shared across action dimensions)
         vars = torch.zeros(features.shape[0], self.action_space).to(features.device)
         vars[:, :] = log_vars.exp().view(-1, 1)
-
-        # Create covariance matrix (diagonal)
         covar_mat = torch.zeros(features.shape[0], self.action_space, self.action_space).to(features.device)
         covar_mat[:, np.arange(self.action_space), np.arange(self.action_space)] = vars
-
-        # Create and return distribution
         dist = torch.distributions.MultivariateNormal(means, covar_mat)
         return dist
 

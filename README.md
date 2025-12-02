@@ -38,3 +38,7 @@ action_space = spaces.Box(
 - `action[2]`: **Steering** (-1.0 = full left, 1.0 = full right)
 
 Note: In practice, gas/brake use range [0, 1] and steering uses [-1, 1].
+
+
+###
+uv run trainer.py --num-updates 1000 --trajectory-path trajectory_data.pkl

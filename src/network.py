@@ -13,7 +13,6 @@ import tmrl
 # ============================================================
 # CNN Architecture Configuration
 # ============================================================
-# Default TMRL configuration: 4 grayscale images of 64 x 64 pixels
 imgs_buf_len = 4  # Number of stacked grayscale images
 img_height = 64   # Image height in pixels
 img_width = 64    # Image width in pixels
@@ -83,8 +82,6 @@ class TrackMasterCNN(nn.Module):
 
     def __init__(self):
         super(TrackMasterCNN, self).__init__()
-        # Convolutional layers processing screenshots:
-        # The default config.json gives 4 grayscale images of 64 x 64 pixels
         self.h_out, self.w_out = img_height, img_width
         self.conv1 = nn.Conv2d(imgs_buf_len, 64, 8, stride=2)
         self.h_out, self.w_out = conv2d_out_dims(self.conv1, self.h_out, self.w_out)
@@ -96,7 +93,6 @@ class TrackMasterCNN(nn.Module):
         self.h_out, self.w_out = conv2d_out_dims(self.conv4, self.h_out, self.w_out)
         self.out_channels = self.conv4.out_channels
 
-        # Dimensionality of the CNN output:
         self.flat_features = self.out_channels * self.h_out * self.w_out
 
         # Dimensionality of the MLP input:
@@ -108,9 +104,6 @@ class TrackMasterCNN(nn.Module):
         float_features = 9
         self.mlp_input_features = self.flat_features + float_features
 
-        # MLP layers:
-        # (when using the model as a policy, we will sample from a multivariate gaussian defined later;
-        # thus, the output dimensionality is 1 for the critic, and we will define the output layer of policies later)
         self.mlp_layers = [256, 256]
         self.mlp = mlp([self.mlp_input_features] + self.mlp_layers, nn.ReLU)
 
@@ -132,23 +125,15 @@ class TrackMasterCNN(nn.Module):
         gear = gear / 6.0       # Max gear 6
         images = images / 255.0
 
-        # we will stack these greyscale images along the channel dimension of our input tensor)
         x = F.relu(self.conv1(images))
         x = F.relu(self.conv2(x))
         x = F.relu(self.conv3(x))
         x = F.relu(self.conv4(x))
 
-        # Now we will flatten our output feature map.
-        # Let us double-check that our dimensions are what we expect them to be:
         flat_features = num_flat_features(x)
         assert flat_features == self.flat_features, f"x.shape:{x.shape}, flat_features:{flat_features}, self.out_channels:{self.out_channels}, self.h_out:{self.h_out}, self.w_out:{self.w_out}"
 
-        # All good, let us flatten our output feature map:
         x = x.view(-1, flat_features)
-
-        # Concat and feed the result along our float values to the MLP:
         x = torch.cat((speed, gear, rpm, x, act1, act2), -1)
         x = self.mlp(x)
-
-        # And this gives us the output of our deep neural network :)
         return x
