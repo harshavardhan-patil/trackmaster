@@ -10,3 +10,7 @@ wheels/
 .venv
 
 tmrl_presentation_data
+
+mlruns
+
+checkpoints

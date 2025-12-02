@@ -42,3 +42,40 @@ Note: In practice, gas/brake use range [0, 1] and steering uses [-1, 1].
 
 ###
 uv run trainer.py --num-updates 1000 --trajectory-path trajectory_data.pkl
+
+
+Dataset Structure
+
+Files:
+- pretrain.h5 - Training dataset (120 episodes, 79,991 transitions)
+- preval.h5 - Validation dataset
+
+Top-level groups:
+1. actions - Shape: (79991, 3)
+- Expert actions: [gas, brake, steering]
+2. observations/ - Group containing:
+- speed - Shape: (79991,) - Current speed
+- gear - Shape: (79991,) - Current gear
+- rpm - Shape: (79991,) - Current RPM
+- images - Shape: (79991, 4, 64, 64) - 4 stacked grayscale images (64x64)
+- act1 - Shape: (79991, 3) - Previous action t-1
+- act2 - Shape: (79991, 3) - Previous action t-2
+3. metadata/ - Group containing:
+- episode_lengths - Shape: (120,) - Length of each episode
+- episode_rewards - Shape: (120,) - Total reward for each episode
+
+Key Statistics:
+- Total episodes: 120
+- Total transitions: 79,991
+- Mean episode length: ~667 steps
+- Mean episode reward: ~210-211 points
+- Sample episode lengths: [557, 537, 503, 552, 540, ...]
+
+Important Note:
+The dataset contains episode-level rewards only (not per-timestep rewards). This means
+you'll need to:
+1. Distribute the episode reward across timesteps, OR
+2. Calculate discounted returns (G_t) by working backwards from episode end
+
+The observations follow the TMRL format: (speed, gear, rpm, images, act1, act2) which
+matches the network architecture in agent.py and network.py.
