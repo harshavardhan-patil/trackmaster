@@ -206,7 +206,7 @@ def main():
                 best_val_loss = val_loss
                 checkpoint_path = os.path.join(args.checkpoint_dir, 'best_pretrained.pt')
                 torch.save(agent.state_dict(), checkpoint_path)
-                print(f"  ✓ Best model saved (val_loss: {best_val_loss:.6f})")
+                print(f"  Best model saved (val_loss: {best_val_loss:.6f})")
             print()
 
         # Log best validation loss

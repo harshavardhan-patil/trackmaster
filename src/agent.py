@@ -64,9 +64,12 @@ class Actor(nn.Module):
       ], dim=1)
 
         log_vars = self.actor_logvar(features)
+        # Reduce std to 20% by adding log(0.04) ≈ -3.219 to log_vars
+        # Since std = exp(log_var/2), reducing std by 0.2x means log_var' = log_var + 2*log(0.2)
+        log_vars = log_vars + np.log(0.04)
         # Clamp log_variance to a safe range
-        # min -20 (std ~0.00004), max 2 (std ~2.7)
-        log_vars = torch.clamp(log_vars, min=-20, max=2)
+        # min -23.219 (std ~0.000009), max -1.219 (std ~0.544)
+        log_vars = torch.clamp(log_vars, min=-23.219, max=-1.219)
         
         vars = torch.zeros(features.shape[0], self.action_space).to(features.device)
         vars[:, :] = log_vars.exp().view(-1, 1)

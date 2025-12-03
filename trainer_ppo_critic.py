@@ -370,18 +370,19 @@ class PPOTrainer:
         device: Optional[str] = None,
         # Hyperparameters
         policy_lr: float = 1e-5,
-        critic_lr: float = 1e-5,
+        critic_lr: float = 1e-4,
         gamma: float = 0.996,
         clip_coef: float = 0.2,
         critic_coef: float = 0.1,
         entropy_coef: float = 0.0001,
-        batch_size: int = 256,
+        batch_size: int = 128,
         epochs_per_update: int = 8,
         episodes_per_update: int = 8,
+        hidden_dim: int = 32,
         norm_advantages: bool = True,
         grad_clip_val: float = 0.5,
-        gae_lambda: float = 0.98,
-        initial_std: float = 0.3,
+        gae_lambda: float = 0.95,
+        initial_std: float = 0.0,
         avg_ray: float = 400.0,
         # Trajectory reward parameters
         reward_scale: float = 0.1,
@@ -393,7 +394,7 @@ class PPOTrainer:
         final_failure_countdown: int = 200,
         initial_min_steps: int = 500,
         final_min_steps: int = 700,
-        curriculum_updates: int = 400
+        curriculum_updates: int = 100
     ):
         """
         Initialize fully local trainer
@@ -412,6 +413,7 @@ class PPOTrainer:
             batch_size: Mini-batch size for training
             epochs_per_update: Number of epochs per training update
             episodes_per_update: Number of episodes to collect before each training update
+            hidden_dim: Hidden layer dimension
             norm_advantages: Whether to normalize advantages
             grad_clip_val: Gradient clipping value
             gae_lambda: GAE lambda parameter for advantage estimation (0.0 = no GAE, 1.0 = Monte Carlo)
@@ -457,6 +459,7 @@ class PPOTrainer:
             'batch_size': batch_size,
             'epochs_per_update': epochs_per_update,
             'episodes_per_update': episodes_per_update,
+            'hidden_dim': hidden_dim,
             'norm_advantages': norm_advantages,
             'grad_clip_val': grad_clip_val,
             'gae_lambda': gae_lambda,
@@ -568,10 +571,11 @@ class PPOTrainer:
         # Get action from policy
         self.agent.eval()
         with torch.no_grad():
-            action, logprob = self.agent.policy.sample_action_with_logprobs(obs_tensor)
+            action = self.agent.policy.mean_only(obs_tensor)
+            # action, logprob = self.agent.policy.sample_action_with_logprobs(obs_tensor)
             state_value = self.agent.critic(obs_tensor)
 
-        return action[0].cpu().numpy(), logprob[0].cpu().numpy(), state_value[0, 0].cpu().item()
+        return action[0].cpu().numpy(), 0.0, state_value[0, 0].cpu().item()
 
     def update_curriculum(self):
         """
@@ -932,29 +936,23 @@ class PPOTrainer:
                 total_loss = ppo_loss + self.hyper_params['critic_coef'] * v_loss - self.hyper_params['entropy_coef'] * entropy_mean
 
                 # ========== Optimization ==========
-                self.policy_optim.zero_grad()
+                # CRITIC ONLY - Actor is frozen
                 self.critic_optim.zero_grad()
 
                 total_loss.backward()
 
-                # Gradient clipping using global norm (as per PPO2 standard)
-                nn.utils.clip_grad_norm_(
-                    self.agent.policy.parameters(),
-                    max_norm=self.hyper_params['grad_clip_val']
-                )
-
-                # Handle NaN gradients
+                # Zero out policy gradients to ensure actor stays frozen
                 for param in self.agent.policy.parameters():
                     if param.grad is not None:
-                        mask = torch.isnan(param.grad)
-                        param.grad[mask] = 0.0
+                        param.grad.zero_()
 
+                # Gradient clipping for critic only
                 nn.utils.clip_grad_norm_(
                     self.agent.critic.parameters(),
                     max_norm=self.hyper_params['grad_clip_val']
                 )
 
-                self.policy_optim.step()
+                # Update critic only
                 self.critic_optim.step()
 
                 # Record losses
@@ -1019,7 +1017,7 @@ class PPOTrainer:
             mlflow.log_artifact(local_path=checkpoint_path, run_id=self.mlflow_runid)
 
         # Periodic checkpoint
-        if self.update_count % 1 == 0:
+        if self.update_count % 2 == 0:
             checkpoint_name = f"checkpoint_update{self.update_count}.pt"
             checkpoint_path = os.path.join(self.checkpoint_dir, checkpoint_name)
             torch.save({
@@ -1039,14 +1037,8 @@ class PPOTrainer:
         if self.device.type == 'cuda':
             torch.cuda.synchronize()
 
-    def load_checkpoint(self, checkpoint_path: str, load_training_history: bool = False):
-        """
-        Load model from checkpoint
-
-        Args:
-            checkpoint_path: Path to the checkpoint file
-            load_training_history: If False, skip loading training history and update count (default: True)
-        """
+    def load_checkpoint(self, checkpoint_path: str):
+        """Load model from checkpoint"""
         print(f"Loading checkpoint from {checkpoint_path}...")
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
 
@@ -1068,23 +1060,18 @@ class PPOTrainer:
             else:
                 print(f"  [INFO] Critic optimizer state not found, using fresh optimizer")
 
-            # Load training metadata if available and requested
-            if load_training_history:
-                if 'update_count' in checkpoint:
-                    self.update_count = checkpoint['update_count']
-                    print(f"  [OK] Resuming from update {self.update_count}")
-                else:
-                    print(f"  [INFO] Update count not found, starting from 0")
-
-                if 'training_history' in checkpoint:
-                    self.training_history = checkpoint['training_history']
-                    print(f"  [OK] Loaded training history ({len(self.training_history)} entries)")
-                else:
-                    print(f"  [INFO] Training history not found, starting fresh")
+            # Load training metadata if available
+            if 'update_count' in checkpoint:
+                self.update_count = checkpoint['update_count']
+                print(f"  [OK] Resuming from update {self.update_count}")
             else:
-                print(f"  [INFO] Skipping training history and update count (fresh start)")
-                self.update_count = 0
-                self.training_history = []
+                print(f"  [INFO] Update count not found, starting from 0")
+
+            if 'training_history' in checkpoint:
+                self.training_history = checkpoint['training_history']
+                print(f"  [OK] Loaded training history ({len(self.training_history)} entries)")
+            else:
+                print(f"  [INFO] Training history not found, starting fresh")
 
         else:
             # Simple checkpoint with just model weights (state dict directly)
@@ -1302,7 +1289,7 @@ class PPOTrainer:
             print(f"{'='*60}\n")
 
             # Save final checkpoint
-            final_checkpoint_path = os.path.join(self.checkpoint_dir, "final_checkpoint.pt")
+            final_checkpoint_path = os.path.join(self.checkpoint_dir, "final_pretrained_critic.pt")
             torch.save({
                 'agent_state_dict': self.agent.state_dict(),
                 'policy_optim_state_dict': self.policy_optim.state_dict(),
