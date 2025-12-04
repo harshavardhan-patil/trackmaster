@@ -59,7 +59,7 @@ def load_model(checkpoint_path, device='cpu'):
     # Load state dict
     if 'agent_state_dict' in checkpoint:
         agent.load_state_dict(checkpoint['agent_state_dict'])
-        print("✓ Loaded agent_state_dict from checkpoint")
+        print(" Loaded agent_state_dict from checkpoint")
 
         # Print additional info if available
         if 'update_count' in checkpoint:
@@ -178,7 +178,7 @@ def run_episode(agent, env, device='cpu', max_steps=2000, deterministic=True, ve
 
 def main():
     parser = argparse.ArgumentParser(description='TrackMaster - Load and run a trained model')
-    parser.add_argument('checkpoint', type=str, help='Path to the .pt checkpoint file')
+    parser.add_argument('--checkpoint', type=str, help='Path to the .pt checkpoint file')
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda'],
                         help='Device to run inference on (default: cpu)')
     parser.add_argument('--max-steps', type=int, default=2000,

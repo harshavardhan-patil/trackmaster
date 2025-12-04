@@ -210,9 +210,9 @@ class RewardFunction:
         # ------------------------------------------------
 
         # A. Progress Reward (Base)
-        progress_reward = (best_idx - self.cur_idx) * self.scale
+        progress_reward = (best_idx - self.cur_idx) * self.scale * 0.5
 
-        # B. Effective Speed Reward (Velocity along the line) - OPTIMIZED
+        # B. Effective Speed Reward (Velocity along the line)
         alignment = 0.0
         # Use dot product and squared norms to avoid sqrt when possible
         dot_product = np.dot(track_vec, car_vec)
@@ -224,21 +224,31 @@ class RewardFunction:
             alignment = dot_product / np.sqrt(norm_track_sq * norm_car_sq)
 
         # Enhanced speed reward with bonus for sustained high speed when aligned
-        if alignment > 0:
+        if alignment > 0 and speed > 80:
             effective_speed_reward = (speed * alignment) * 0.003
 
             # Bonus for sustained high speed when well-aligned
-            if speed > 120 and alignment > 0.8:
+            if alignment > 0.7:
                 effective_speed_reward += 0.3 * self.scale
         else:
             effective_speed_reward = 0.0
+        
+        # Penalize for going too slow, further focusing on high speed
+        effective_speed_penalty = 0.0
+        if speed < 80:
+            effective_speed_penalty = (80 - speed) * 0.0003
+        
+        step_count_penalty = 0.0
+        if self.step_counter > 500:
+            step_count_penalty = 0.01
 
         # C. Distance-from-Centerline Penalty
         # Penalize being too far from the racing line
-        lateral_distance = min_dist
-        centerline_penalty = 0.0
-        if lateral_distance > self.max_dist * 0.5:  # If more than halfway to track edge
-            centerline_penalty = (lateral_distance / self.max_dist) * 0.1 * self.scale
+        # Removed in late training
+        # lateral_distance = min_dist
+        # centerline_penalty = 0.0
+        # if lateral_distance > self.max_dist * 0.5:  # If more than halfway to track edge
+        #     centerline_penalty = (lateral_distance / self.max_dist) * 0.1 * self.scale
 
         # D. Wall Collision Penalty
         # Heavily penalize being very close to track boundaries
@@ -259,16 +269,18 @@ class RewardFunction:
 
         # F. Gas Bias
         # If throttle (action[1]) > 0.8
-        gas_bonus = 0.0
-        if action[1] > 0.8:
-            gas_bonus = 0.5 * self.scale
+        # Removed in late training
+        # gas_bonus = 0.0
+        # if action[1] > 0.8:
+        #     gas_bonus = 0.5 * self.scale
 
         # G. Reverse Tax
         # Penalty for reversing to avoid reward hacking
         # gear == 0 means reverse gear
-        reverse_tax = 0.0
-        if gear == 0:
-            reverse_tax = speed * self.scale
+        # Removed in late training
+        # reverse_tax = 0.0
+        # if gear == 0:
+        #     reverse_tax = speed * self.scale
 
         # H. Parking Fine
         # If we are 2 seconds into the race and stopped, punish idleness.
@@ -280,22 +292,26 @@ class RewardFunction:
         # ------------------------------------------------
         total_reward = (progress_reward
                         + effective_speed_reward
-                        + gas_bonus
-                        - centerline_penalty
+                        - effective_speed_penalty
+                        - step_count_penalty
+                        # + gas_bonus
+                        # - centerline_penalty
                         - wall_collision_penalty
                         - steering_jerk_penalty
-                        - reverse_tax
+                        # - reverse_tax
                         - parking_fine)
 
         # Package individual components for logging
         reward_components = {
             'progress_reward': progress_reward,
             'effective_speed_reward': effective_speed_reward,
-            'gas_bonus': gas_bonus,
-            'centerline_penalty': centerline_penalty,
+            'effective_speed_penalty': effective_speed_penalty,
+            'step_count_penalty': step_count_penalty,
+            # 'gas_bonus': gas_bonus,
+            # 'centerline_penalty': centerline_penalty,
             'wall_collision_penalty': wall_collision_penalty,
             'steering_jerk_penalty': steering_jerk_penalty,
-            'reverse_tax': reverse_tax,
+            # 'reverse_tax': reverse_tax,
             'parking_fine': parking_fine
         }
 
@@ -364,13 +380,14 @@ class PPOTrainer:
 
     def __init__(
         self,
-        max_episode_steps: int = 1800,
+        max_episode_steps: int = 1000,
         checkpoint_dir: str = "./checkpoints",
         trajectory_path: Optional[str] = None,
         device: Optional[str] = None,
+        validation_lap_count: int = 4,
         # Hyperparameters
-        policy_lr: float = 1e-5,
-        critic_lr: float = 1e-5,
+        policy_lr: float = 2e-5,
+        critic_lr: float = 3e-5,
         gamma: float = 0.996,
         clip_coef: float = 0.2,
         critic_coef: float = 0.1,
@@ -403,6 +420,7 @@ class PPOTrainer:
             checkpoint_dir: Directory to save model checkpoints
             trajectory_path: Path to trajectory file for guided learning (optional)
             device: Device to use ('cuda' or 'cpu', auto-detect if None)
+            validation_lap_count: Number of validation laps to run after each update (default: 3)
             policy_lr: Learning rate for policy network
             critic_lr: Learning rate for critic network
             gamma: Discount factor
@@ -431,6 +449,7 @@ class PPOTrainer:
         """
         self.max_episode_steps = max_episode_steps
         self.checkpoint_dir = checkpoint_dir
+        self.validation_lap_count = validation_lap_count
         self.mlflow_runid = None
 
         # Create checkpoint directory
@@ -550,7 +569,7 @@ class PPOTrainer:
         interface._cached_data = None
         print(" Interface patched to cache position data")
 
-    def get_action(self, observation: Tuple) -> Tuple[np.ndarray, float, float]:
+    def get_action_sampled(self, observation: Tuple) -> Tuple[np.ndarray, float, float]:
         """
         Get action from policy
 
@@ -572,6 +591,99 @@ class PPOTrainer:
             state_value = self.agent.critic(obs_tensor)
 
         return action[0].cpu().numpy(), logprob[0].cpu().numpy(), state_value[0, 0].cpu().item()
+
+    def get_action_mean(self, observation: Tuple) -> np.ndarray:
+        """
+        Get action from policy
+
+        Args:
+            observation: TMRL observation tuple
+
+        Returns:
+            action: numpy array [3] with values in [-1, 1]
+        """
+        # Convert observation to tensor tuple
+        obs_tensor = env_obs_to_tensor(observation, device=self.device)
+
+        # Get action from policy
+        self.agent.eval()
+        with torch.no_grad():
+            action = self.agent.policy.mean_only(obs_tensor)
+
+        action = action[0].cpu().numpy()
+        return np.clip(action, -1, 1)
+
+    def run_validation(self) -> Dict[str, Any]:
+        """
+        Run validation by executing the agent for multiple laps and tracking lap times.
+
+        A lap is considered complete when the agent reaches 90% of the trajectory length.
+
+        Returns:
+            Dictionary containing validation metrics:
+                - lap_times: list of lap times in seconds
+                - mean_lap_time: average lap time in seconds
+                - successful_laps: number of laps completed
+        """
+        print(f"\n{'='*60}")
+        print("Running Validation")
+        print(f"{'='*60}")
+
+        lap_times = []
+        trajectory_length = len(self.trajectory_reward_fn.trajectory)
+
+        for lap_idx in range(self.validation_lap_count):
+            print(f"\n  Validation lap {lap_idx + 1}/{self.validation_lap_count}...")
+
+            # Reset environment
+            obs = self.env.reset()[0]
+            self.trajectory_reward_fn.reset()
+
+            lap_start_time = time.time()
+            step_count = 0
+            done = False
+            while not done and step_count < 800:
+                # Get action from policy (no exploration, deterministic)
+                action = self.get_action_mean(obs)
+
+                # Step environment
+                clamped_action = np.clip(action, -1, 1)
+                next_obs, _, terminated, truncated, _ = self.env.step(clamped_action)
+
+                obs = next_obs
+                done = terminated or truncated
+                step_count += 1
+
+            if done:
+                lap_time = time.time() - lap_start_time
+                lap_times.append(lap_time)
+
+            # Pause environment
+            self.env.unwrapped.wait()
+
+        # Calculate statistics
+        successful_laps = len(lap_times)
+        mean_lap_time = np.mean(lap_times) if lap_times else 0.0
+
+        print(f"\n{'='*60}")
+        print(f"Validation Summary:")
+        print(f"  Successful laps: {successful_laps}/{self.validation_lap_count}")
+        if lap_times:
+            print(f"  Lap times: {[f'{t:.2f}s' for t in lap_times]}")
+            print(f"  Mean lap time: {mean_lap_time:.2f}s")
+            print(f"  Best lap time: {min(lap_times):.2f}s")
+            print(f"  Worst lap time: {max(lap_times):.2f}s")
+        else:
+            print(f"  No laps completed")
+        print(f"{'='*60}\n")
+
+        return {
+            'lap_times': lap_times,
+            'mean_lap_time': float(mean_lap_time),
+            'successful_laps': successful_laps,
+            'best_lap_time': float(min(lap_times)) if lap_times else 0.0,
+            'worst_lap_time': float(max(lap_times)) if lap_times else 0.0
+        }
 
     def update_curriculum(self):
         """
@@ -632,11 +744,13 @@ class PPOTrainer:
         reward_component_totals = {
             'progress_reward': 0.0,
             'effective_speed_reward': 0.0,
-            'gas_bonus': 0.0,
-            'centerline_penalty': 0.0,
+            'effective_speed_penalty': 0.0,
+            'step_count_penalty': 0.0,
+            # 'gas_bonus': 0.0,
+            #'centerline_penalty': 0.0,
             'wall_collision_penalty': 0.0,
             'steering_jerk_penalty': 0.0,
-            'reverse_tax': 0.0,
+            #'reverse_tax': 0.0,
             'parking_fine': 0.0
         }
 
@@ -653,7 +767,7 @@ class PPOTrainer:
 
         while not done and step_count < self.max_episode_steps:
             # 1. Get action from policy
-            action, logprob, state_value = self.get_action(obs)
+            action, logprob, state_value = self.get_action_sampled(obs)
 
             # 2. Step environment
             # This internally calls retrieve_data() and caches it via our patch
@@ -733,7 +847,7 @@ class PPOTrainer:
                 final_obs_tensor = env_obs_to_tensor(obs, device=self.device)
                 final_state_value = self.agent.critic(final_obs_tensor)[0, 0].cpu().item()
 
-        print(f"  ✓ Episode collected: {step_count} steps, reward: {episode_reward:.2f}, time: {elapsed:.1f}s")
+        print(f"   Episode collected: {step_count} steps, reward: {episode_reward:.2f}, time: {elapsed:.1f}s")
         if terminated:
             print(f"    Episode ended: TERMINATED (track completed or failed)")
         elif is_truncated:
@@ -791,7 +905,7 @@ class PPOTrainer:
                 # Extract episode data
                 observations = episode_data['observations']
                 actions = torch.tensor(np.array(episode_data['actions']), dtype=torch.float32)
-                logprobs = torch.tensor(episode_data['logprobs'], dtype=torch.float32)
+                logprobs = torch.tensor(np.array(episode_data['logprobs']), dtype=torch.float32)
                 rewards = torch.tensor(episode_data['rewards'], dtype=torch.float32)
                 state_values = torch.tensor(episode_data['state_values'], dtype=torch.float32)
                 terminated = episode_data['terminated']
@@ -995,11 +1109,13 @@ class PPOTrainer:
             metrics['reward_components'] = {
                 'progress_reward': float(avg_comps['progress_reward']),
                 'effective_speed_reward': float(avg_comps['effective_speed_reward']),
-                'gas_bonus': float(avg_comps['gas_bonus']),
-                'centerline_penalty': float(avg_comps['centerline_penalty']),
+                'effective_speed_penalty':  float(avg_comps['effective_speed_penalty']),
+                'step_count_penalty': float(avg_comps['step_count_penalty']),
+                #'gas_bonus': float(avg_comps['gas_bonus']),
+                # 'centerline_penalty': float(avg_comps['centerline_penalty']),
                 'wall_collision_penalty': float(avg_comps['wall_collision_penalty']),
                 'steering_jerk_penalty': float(avg_comps['steering_jerk_penalty']),
-                'reverse_tax': float(avg_comps['reverse_tax']),
+                # 'reverse_tax': float(avg_comps['reverse_tax']),
                 'parking_fine': float(avg_comps['parking_fine'])
             }
 
@@ -1229,6 +1345,12 @@ class PPOTrainer:
                 # 2. Train on collected episodes (synchronous - no network delay!)
                 self.train_on_episodes(episodes_data)
 
+                # 3. Run validation
+                validation_metrics = self.run_validation()
+
+                # Add validation metrics to training history
+                self.training_history[-1]['validation_metrics'] = validation_metrics
+
                 elapsed = time.time() - start_time
 
                 # Calculate aggregate statistics
@@ -1244,7 +1366,10 @@ class PPOTrainer:
                     'mean_reward': mean_reward,
                     'mean_advantage': self.training_history[-1]['mean_advantage'],
                     'mean_return': self.training_history[-1]['mean_return'],
-                    'mean_episode_steps': mean_episode_length
+                    'mean_episode_steps': mean_episode_length,
+                    'validation_mean_lap_time': validation_metrics['mean_lap_time'],
+                    'validation_successful_laps': validation_metrics['successful_laps'],
+                    'validation_best_lap_time': validation_metrics['best_lap_time']
                 }
 
                 # Log mean reward components if available
@@ -1287,11 +1412,6 @@ class PPOTrainer:
                             avg_comps[key] += value
                     for key in avg_comps:
                         avg_comps[key] /= len(episodes_data)
-
-                    print(f"\n  Average reward breakdown:")
-                    print(f"    Rewards: Progress: {avg_comps['progress_reward']:.2f} | Speed: {avg_comps['effective_speed_reward']:.2f} | Gas: {avg_comps['gas_bonus']:.2f}")
-                    print(f"    Penalties: Centerline: -{avg_comps['centerline_penalty']:.2f} | Wall: -{avg_comps['wall_collision_penalty']:.2f} | Steering: -{avg_comps['steering_jerk_penalty']:.2f}")
-                    print(f"    Other: Reverse: -{avg_comps['reverse_tax']:.2f} | Parking: -{avg_comps['parking_fine']:.2f}")
 
                 print(f"{'='*60}")
 

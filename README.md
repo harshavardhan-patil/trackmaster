@@ -33,11 +33,10 @@ action_space = spaces.Box(
 ```
 
 **Action Components:**
-- `action[0]`: **Gas** (-1.0 = no gas, 1.0 = full gas)
-- `action[1]`: **Brake** (-1.0 = no brake, 1.0 = full brake)
+- `action[0]`: **Gas** (0.0 = no gas, 1.0 = full gas)
+- `action[1]`: **Brake** (0.0 = no brake, 1.0 = full brake)
 - `action[2]`: **Steering** (-1.0 = full left, 1.0 = full right)
 
-Note: In practice, gas/brake use range [0, 1] and steering uses [-1, 1].
 
 
 ###

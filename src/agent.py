@@ -18,8 +18,7 @@ class Actor(nn.Module):
 
         # Action mean layer (outputs 3 actions: steering, throttle, brake)
         self.action_mean = nn.Sequential(
-            nn.Linear(mlp_output_size, action_space),
-            nn.Tanh()  # Bound actions to [-1, 1]
+            nn.Linear(mlp_output_size, action_space)
         )
 
         # Action log variance layer (single shared variance for all action dimensions)
